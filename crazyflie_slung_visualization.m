@@ -170,7 +170,10 @@ yawDeg = rad2deg(atan2(squeeze(sim.loadRotationLog(2, 1, :)), ...
 yawUnwrap = unwrapLocal(yawDeg);
 
 yawDesUnwrap = [];
-if isfield(sim, 'loadYawRefLog') && any(sim.loadYawRefLog ~= 0)
+if isfield(sim, 'loadYawRefLog') && numel(sim.loadYawRefLog) == numel(time)
+    % ★★ 守卫必须只看【字段是否存在 + 长度是否对得上】，**绝不能用 any(... ~= 0)**：
+    %    期望 yaw 恒为 0 的工况（lockYaw = true / 定高）下 loadYawRefLog 全为 0，
+    %    用后者会把"恒为 0 的合法数据"误判成"没有数据"，参考曲线就不画了。
     yawDesUnwrap = unwrapLocal(rad2deg(sim.loadYawRefLog(:).'));
     % ★ 两条曲线必须对齐到**同一支**：各自 unwrap 后可能相差整数个 360°，
     %   不对齐就会出现"一条在 +170、另一条在 -190"的假象。
