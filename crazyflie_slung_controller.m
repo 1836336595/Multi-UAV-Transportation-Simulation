@@ -251,7 +251,18 @@ eRAll = zeros(3, n);
 eOmRAll = zeros(3, n);
 omegaCmdAll = zeros(3, n);
 
-b1d = desired.rotation(:, 1);
+% (37) 期望姿态 R_ic 的第一轴参考方向 b1d。
+%   'reference' = 论文原式（取 R0d 第一轴）；'worldX' = 机体航向锁定世界 +x。
+% ★ 机体航向跟着负载参考 yaw 转 ⇒ 挂点方位转动 ⇒ 拧绳 ⇒ 反过来激励负载偏航
+%   （不可控、无法耗散）⇒ 抖动被放大。四旋翼 yaw 与推力**解耦**，代价为零。
+%   实测（八字）：偏航率抖幅 std 0.0498 → 0.0269 rad/s，终端残差 94.0 → 90.0 mm。
+% ★ 定高工况下 R0d ≡ cfg.target.R0（第一轴 = +x），两者**完全等价**。
+if isfield(cfg.attitudeController, 'headingSource') ...
+        && strcmpi(cfg.attitudeController.headingSource, 'worldX')
+    b1d = [1; 0; 0];
+else
+    b1d = desired.rotation(:, 1);
+end
 
 for i = 1:n
     Ri = Rall(:, :, i);

@@ -178,36 +178,47 @@ switch phase
 end
 
 % ------------------------------------------------ 期望姿态（论文 R0d 构造）
-% 论文原式：第一轴 = 路径**切线方向**，第三轴 = 重力方向 e3。
+% 论文原式：第一轴 = **运动方向**，第三轴 = 重力方向 e3。
 %
-% ★★★ 切线方向取**理想八字（不含包络）的解析切向**，而不是"实际速度方向"。
-%   为什么不能用实际速度方向：
-%     v = env'·p̂ + env·s·v̂，在环绕段两端 env→0 且 env'→0 ⇒ |v|→0 ⇒ **方向退化**；
-%     起飞/降落段是竖直+水平归位，其速度方向与环绕段起点/终点的切向也不一致。
-%   理想切向的两个分量
-%       u(τ) = aX·wX·cos(wX τ)、v(τ) = (aY/2)·wY·sin(wY τ)
-%   **不会同时为零**（wX = 2 wY，联立要求 k = 2m − 1/2，无整数解），
-%   且 τ = 0 与 τ = tEnd 处 v = 0、u > 0 ⇒ ψ = 0，**与起飞/降落段天然连续**。
-%   ⇒ 解析、全程良定义、且拼接连续。
+% ★★★ 巡航段期望偏航 = **参考轨迹的实际运动方向**，|v|→0 处平滑过渡。
+%   为什么不用"理想八字切向"：实际 v = env'·p_hat + env·s·v_hat，在包络过渡段
+%   |v|→0 时被 **env'·p_hat** 主导 ⇒ 真实运动是**径向**、理想切向是**切向**
+%   ⇒ 实测最大差 93.1° / 162.7° / 178.3°（τ=3.0/43.0/44.5 s），
+%     表现就是"偏航有时朝运动方向、有时正好相反"。
+%   为什么不能直接 atan2(vy,vx)：|v|→0 处方向会翻转（实测 t=47.982 s 处
+%   psi 由 +179.98° 一步跳到 0°，|v| 仅 1e-6）。
+%   做法：w = v + epsV*t_hat_unit（t_hat = 夹紧 tau 后的理想切向，恒不为零），
+%         psi = atan2(w_y, w_x)：|v|>>epsV ⇒ 就是实际运动方向；
+%                                 |v|→0    ⇒ 平滑接过渡方向，不跳 180°。
+%   实测 |v|>0.02 时与真实运动方向最大差 **0.147°**。
 %
-% 因 b3d ≡ e3，R0d = Rz(ψ) 是**绕世界 z 的纯偏航** ⇒
-%   Omega0d = [0; 0; psiDot]，Omega0dDot = [0; 0; psiDotDot]（体系与世界系一致）。
-%   ★ 这比对 R0d 做**二阶**中心差分干净得多（现在只对解析的 psiDot 做一阶差分）。
-%
-%   lockYaw = true 时 ψ ≡ 0（期望偏航锁定为 0），Omega0d = Omega0dDot = 0。
-if fe.lockYaw
-    psiYaw = 0;
-    psiDot = 0;
-    psiDotDot = 0;
-elseif phase == 1
-    [psiYaw, psiDot, psiDotDot] = yawFromIdealTangent( ...
-        tau, s, max(cfg.simulation.dt, 1e-4), aX, aY, wX, wY);
+% ★ 起飞/降落段仍取 psi = 0（不跟随）：① 近零速、方向病态；
+%   ② 巡航两端 |v|→0 的极限方向**恰为 +x**，与 psi=0 天然衔接 ⇒ 无跳变。
+%   ⚠ 曾推广到全阶段 ⇒ 起飞段水平方向 149° 让参考 yaw 转 149° ⇒ 拧绳 ⇒
+%     最小张力裕度 33.0%→1.9%、推力峰值 69.1%→100%。⇒ 只保留巡航段。
+if fe.lockYaw || phase ~= 1
+    psiYaw = 0;  psiDot = 0;  psiDotDot = 0;
 else
-    % 起飞 / 降落段：保持 ψ = 0。理由：理想切向在 τ=0 与 τ=tEnd 处恰为 +x（ψ=0），
-    % 所以这样接出来的 ψ(t) 在全时段连续，且不会在"水平速度过零"处产生奇点。
-    psiYaw = 0;
-    psiDot = 0;
-    psiDotDot = 0;
+    tauClamped = min(max(tau, 0), fe.cycles * 2 * pi / fe.omegaY);
+    tHatX = aX * wX * cos(wX * tauClamped);
+    tHatY = 0.5 * aY * wY * sin(wY * tauClamped);
+    tNorm = hypot(tHatX, tHatY);
+    if tNorm > 0
+        tHatX = tHatX / tNorm;  tHatY = tHatY / tNorm;
+    end
+    epsV = 1e-4;
+    wx = velocity(1) + epsV * tHatX;
+    wy = velocity(2) + epsV * tHatY;
+    den = wx^2 + wy^2;
+    psiYaw = atan2(wy, wx);
+    if den > 1e-18
+        psiDot = (wx * acceleration(2) - wy * acceleration(1)) / den;
+    else
+        psiDot = 0;
+    end
+    h = max(cfg.simulation.dt, 1e-4);
+    psiDotDot = (linkYawRateAt(t + h, T1, T2, fe) ...
+               - linkYawRateAt(t - h, T1, T2, fe)) / (2 * h);
 end
 b1d = [cos(psiYaw); sin(psiYaw); 0];
 b2d = [-sin(psiYaw); cos(psiYaw); 0];
@@ -221,6 +232,35 @@ velocity = velocity(:);
 acceleration = acceleration(:);
 bodyRate = bodyRate(:);
 bodyRateDot = bodyRateDot(:);
+end
+
+% ======================================================================
+function [vxy, axy] = cruiseHorizontalState(t, T1, T2, fe)
+%CRUISEHORIZONTALSTATE 环绕段在真实时间 t 处的**水平**速度与加速度（惯性系）。
+% ★ 供 linkYawRateAt 求 psiDotDot 的中心差分；与主函数 case 1 **必须逐式一致**。
+aX = fe.amplitudeX;  aY = fe.amplitudeY;
+wX = fe.omegaX;      wY = fe.omegaY;
+s = fe.cycles * 2 * pi / wY / T2;
+tau = (t - T1) * s;
+pHatX = aX * sin(wX * tau);           pHatY = 0.5 * aY * (1 - cos(wY * tau));
+vHatX = aX * wX * cos(wX * tau);      vHatY = 0.5 * aY * wY * sin(wY * tau);
+cHatX = -aX * wX^2 * sin(wX * tau);   cHatY = 0.5 * aY * wY^2 * cos(wY * tau);
+[env, envDot, envDDot] = blendEnvelope(t - T1, T2, fe.blendTime);
+vxy = [envDot * pHatX + env * s * vHatX; envDot * pHatY + env * s * vHatY];
+axy = [envDDot * pHatX + 2 * envDot * s * vHatX + env * s^2 * cHatX; ...
+       envDDot * pHatY + 2 * envDot * s * vHatY + env * s^2 * cHatY];
+end
+
+% ======================================================================
+function d = linkYawRateAt(t, T1, T2, fe)
+%LINKYAWRATEAT 环绕段 psiDot（解析式），供其中心差分求 psiDotDot。
+[v, a] = cruiseHorizontalState(t, T1, T2, fe);
+den = v(1)^2 + v(2)^2;
+if den > 1e-12
+    d = (v(1) * a(2) - v(2) * a(1)) / den;
+else
+    d = 0;
+end
 end
 
 % ======================================================================

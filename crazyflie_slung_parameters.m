@@ -36,7 +36,7 @@ end
 %   回升、77.2 s 完全发散（因偏航欠驱动漂移），故 30 s 是静态工况的最优窗口。
 %   dt = 0.002 s 对应 500 Hz。
 cfg.simulation = struct(...
-    'duration', 30.0, ...          % 本存档：定高悬停 30 s（悬停收敛需要更长时间）
+    'duration', 30.0, ...          % 定高悬停 30 s（悬停收敛需要更长时间）
     'dt', 0.002, ...               % 控制/积分步长 [s]
     'maxPendulumRate', 12.0, ...   % 绳索角速度安全上限 [rad/s]，仅数值保护
     'maxBodyRate', 12.0);          % 机体角速度安全上限 [rad/s]，仅数值保护
@@ -185,9 +185,9 @@ kRLoad = diag(payloadInertia) .* wnLoad.^2;
 kOmegaLoad = 2 * zetaLoad * wnLoad .* diag(payloadInertia);
 
 cfg.loadController = struct(...
-    'kx', [3.0; 3.0; 3.75], ...       % 本存档：定高增益（omega_n ≈ 1.73~1.94 rad/s）
-    'kv', [3.12; 3.12; 3.12], ...     % 本存档：定高增益（zeta ≈ 0.90）
-    'ki', [1.60; 1.60; 1.60], ...     % 本存档：定高增益（受限，抗常值扰动）
+    'kx', [3.0; 3.0; 3.75], ...       % 定高增益（omega_n ≈ 1.73~1.94 rad/s）
+    'kv', [3.12; 3.12; 3.12], ...     % 定高增益（zeta ≈ 0.90）
+    'ki', [1.60; 1.60; 1.60], ...     % 定高增益（受限，抗常值扰动）
     'kR', kRLoad, ...                 % 负载姿态增益 [N*m/rad] = J0 .* wn^2
     'kOmega', kOmegaLoad, ...         % 负载角速度增益 [N*m*s/rad] = 2 zeta wn J0
     'c1', 0.50, ...                   % 积分器交叉项系数（抑制饱和下的过冲）
@@ -308,7 +308,8 @@ cfg.attitudeController = struct(...
     'kR', [240.0; 240.0; 120.0], ...  % 姿态误差 -> 角速度 的增益 [rad/s]
     'kOmega', [4.0; 4.0; 4.0], ...    % 角速度误差 -> 角速度 的增益（阻尼）
     'maxBodyRateCommand', [5.0; 5.0; 3.5], ... % 角速度指令限幅 [rad/s]
-    'maxAttitudeError', 2.0);         % 姿态误差范数限幅 [rad]
+    'maxAttitudeError', 2.0, ...      % 姿态误差范数限幅 [rad]
+    'headingSource', 'worldX');       % 机体航向来源：'reference'(论文原式) | 'worldX'(锁定+x)
 
 % --------------------------- 内环速率跟踪（等效 Crazyflie 内部速率 PID 闭环）
 cfg.rateLoop = struct(...
@@ -481,7 +482,7 @@ cfg.figureEight = struct(...
 %     且 tau=0 与 tau=tEnd 处恰为 +x（psi=0），与起飞/降落段的 psi=0 天然连续，
 %     避免了"水平速度过零 ⇒ 方向无定义"的奇点。
 
-cfg.referenceFcn = [];    % ★ 本存档：清空轨迹函数 ⇒ 退回 cfg.target 静态悬停（无八字）
+cfg.referenceFcn = [];    % 定高工况：清空轨迹函数 ⇒ 退回 cfg.target 静态悬停
 cfg.reference.omegaD = zeros(3, 1);    % 兜底值（实际由轨迹函数按解析切向给出）
 cfg.reference.omegaDotD = zeros(3, 1);
 
@@ -491,15 +492,7 @@ cfg.reference.omegaDotD = zeros(3, 1);
 %    （用户要求："八字形的两个圆心应位于圆锥的中心，并围绕该中心进行环绕"。）
 % ★ 障碍物只参与可视化与碰撞自检，不进入动力学（论文也未对其建模）。
 cfg.obstacles = struct();
-% ★ 本存档（仅定高悬停）：★ 关闭锥形障碍物 ★
-%   定高工况根本不做水平运动，没有『绕障』可言 —— 锥体在这里既无物理意义，
-%   也只会污染三维图和自检输出。关闭后三处行为同时改变（都由本开关门控）：
-%     demo 不打印锥信息、不跑锥间隙自检（crazyflie_slung_demo.m 3 处）
-%     simulation 不做净间隙统计（crazyflie_slung_simulation.m 1 处）
-%     visualization 不画锥、也不把锥算进轴框（crazyflie_slung_visualization.m 2 处）
-%   ★ 注意：锥体本来就『只参与可视化与自检、不进入动力学』（论文也未建模），
-%     因此关闭它对轨迹与全部动力学指标【零影响】。
-cfg.obstacles.enabled = false;
+cfg.obstacles.enabled = false;   % 定高不做水平运动，无『绕障』可言 ⇒ 关掉锥体
 % ★★ 锥必须**竖直站立**（底面在地面、尖端朝上），且负载要飞在锥**中部偏上**，
 %    否则负载是从锥尖上方飞过去的，避障约束根本不起作用（见下面的踩坑记录）。
 %
