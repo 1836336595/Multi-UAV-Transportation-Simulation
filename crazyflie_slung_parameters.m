@@ -308,7 +308,10 @@ cfg.attitudeController = struct(...
     'kR', [240.0; 240.0; 120.0], ...  % 姿态误差 -> 角速度 的增益 [rad/s]
     'kOmega', [4.0; 4.0; 4.0], ...    % 角速度误差 -> 角速度 的增益（阻尼）
     'maxBodyRateCommand', [5.0; 5.0; 3.5], ... % 角速度指令限幅 [rad/s]
-    'maxAttitudeError', 2.0);         % 姿态误差范数限幅 [rad]
+    'maxAttitudeError', 2.0, ...      % 姿态误差范数限幅 [rad]
+    'headingSource', 'worldX');       % ★ 机体航向来源：'reference'(论文原式) | 'worldX'(锁定+x)
+                                      %   ★ 默认取 'worldX'：实测负载偏航率抖幅 0.0498 → 0.0269 rad/s，
+                                      %     终端残差 94.0 → 90.0 mm，其余指标不变（见 versions/README.md）
 
 % --------------------------- 内环速率跟踪（等效 Crazyflie 内部速率 PID 闭环）
 cfg.rateLoop = struct(...

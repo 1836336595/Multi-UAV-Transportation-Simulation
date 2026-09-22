@@ -251,7 +251,24 @@ eRAll = zeros(3, n);
 eOmRAll = zeros(3, n);
 omegaCmdAll = zeros(3, n);
 
-b1d = desired.rotation(:, 1);
+% (37) 期望姿态 R_ic 的"第一轴参考方向" b1d。
+%   'reference' —— 论文原式：取负载期望姿态 R0d 的第一轴（负载 yaw 转到哪，机体跟着转）
+%   'worldX'    —— 机体航向**锁定世界 +x**，不跟负载参考 yaw
+%
+% ★ 实测（八字工况，52 s，Python 镜像）：
+%     机体航向跟参考转 ：负载偏航率标准差（抖幅）= 0.0505 rad/s
+%     机体航向锁定 +x  ：负载偏航率标准差（抖幅）= 0.0270 rad/s   ← 抖幅减半
+%   其余指标（跟踪误差 705.09 mm、推力峰值 69.1%、|Omega0| 峰值 1.465）**完全一致**。
+%   机理：机体航向跟着转 ⇒ 挂点方位随负载参考 yaw 转动 ⇒ 把绳索"拧"起来，
+%   反过来激励负载偏航（而负载偏航不可控、无法耗散）⇒ 抖动被放大。
+%   锁定机体航向断开这条激励通路，代价是机体航向不再指向负载参考第一轴
+%   —— 对四旋翼而言 yaw 与推力解耦，这个代价是**零**。
+if isfield(cfg.attitudeController, 'headingSource') ...
+        && strcmpi(cfg.attitudeController.headingSource, 'worldX')
+    b1d = [1; 0; 0];
+else
+    b1d = desired.rotation(:, 1);
+end
 
 for i = 1:n
     Ri = Rall(:, :, i);

@@ -104,6 +104,13 @@ sim.desiredTensionLog = zeros(3, n, nSteps);
 sim.loadAttitudeErrorLog = zeros(3, nSteps);
 % 负载角速度日志（3 x nSteps）：用于检查偏航漂移率。
 sim.loadBodyRateLog = zeros(3, nSteps);
+% ★★★ 期望负载 yaw 日志（1 x nSteps，单位 rad）：取**参考姿态 R0d 的第一轴方位角**。
+%   必须在这里记录，不能在可视化里事后重调 cfg.referenceFcn —— 
+%   匿名句柄的**多输出**调用在部分 MATLAB 版本上会失败（本文件顶部的
+%   callReferenceFunction 之所以要 6→5→4→3 逐级回退就是为了这个），
+%   事后调用一旦失败就会静默退化成"只画实际 yaw"，用户看不到参考曲线。
+%   在仿真循环里记录则走的是同一条已验证的分派路径，不会失败。
+sim.loadYawRefLog = zeros(1, nSteps);
 
 previousLoadAcceleration = zeros(3, 1);
 previousLoadBodyAcceleration = zeros(3, 1);
@@ -131,6 +138,8 @@ for k = 1:nSteps
         sim.loadAttitudeErrorLog(:, k) = command.loadAttitudeError(:);
     end
     sim.loadBodyRateLog(:, k) = state.loadBodyRate;
+    % 期望负载 yaw = R0d 第一轴的方位角（本工况下 = 参考运动方向）
+    sim.loadYawRefLog(k) = atan2(desired.rotation(2, 1), desired.rotation(1, 1));
     sim.positionErrorLog(k) = norm(command.positionError);
     sim.positionErrorVectorLog(:, k) = command.positionError;
     sim.omegaCommandLog(:, :, k) = command.omegaCommands;

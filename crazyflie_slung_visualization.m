@@ -161,20 +161,36 @@ legend(hThrust, arrayfun(@(i) sprintf('机 %d 推力', i), 1:n, ...
 %   "最大机体角速度" 完全重复。负载偏航角才是本仿真最需要被看见的量：
 %   它单调漂移、导致绳向误差缓增、也是三维图里"圆环"的来源。
 subplot(2, 3, 6);
+% ★ 同时画【期望 yaw】与【实际 yaw】，否则看不出"跟没跟上"。
+%   期望 yaw 直接取仿真时记下的 sim.loadYawRefLog（= R0d 第一轴方位角 = 运动方向）。
+%   ★ 两条曲线都必须 **unwrap（解卷绕）**：yaw 是角度，从 +179° 跳到 -179° 只是
+%     跨过 ±180 割线、并非真的反向；不解卷绕就会看成"正负乱跳"。
 yawDeg = rad2deg(atan2(squeeze(sim.loadRotationLog(2, 1, :)), ...
     squeeze(sim.loadRotationLog(1, 1, :))));
-% 用自写的 unwrapLocal 代替 MATLAB 的 unwrap()：后者属 Signal Processing
-% Toolbox，本仿真声明不依赖任何工具箱（见文件头的说明）。
 yawUnwrap = unwrapLocal(yawDeg);
-plot(time, yawUnwrap, 'LineWidth', 1.6, 'Color', [0.55, 0.25, 0.65]);
+
+yawDesUnwrap = [];
+if isfield(sim, 'loadYawRefLog') && any(sim.loadYawRefLog ~= 0)
+    yawDesUnwrap = unwrapLocal(rad2deg(sim.loadYawRefLog(:).'));
+    % ★ 两条曲线必须对齐到**同一支**：各自 unwrap 后可能相差整数个 360°，
+    %   不对齐就会出现"一条在 +170、另一条在 -190"的假象。
+    yawUnwrap = yawUnwrap + 360 * round((yawDesUnwrap(1) - yawUnwrap(1)) / 360);
+end
+
 hold on; grid on;
-% 参考斜率：+0.057 deg/s（实测），用于说明"没有真稳态"
-dtdy = [time(1), time(end)];
-plot(dtdy, yawUnwrap(1) + 0.057 * (dtdy - time(1)), ':', ...
-    'Color', [0.6, 0.6, 0.6], 'LineWidth', 1.0);
-xlabel('时间 (s)'); ylabel('偏航角 (deg)');
-title('负载偏航角（欠驱动自由轴，见 README §5.1）');
-legend({'yaw', '参考斜率 0.057 deg/s'}, 'Location', 'best');
+if ~isempty(yawDesUnwrap)
+    plot(time, yawDesUnwrap, '--', 'LineWidth', 1.8, 'Color', [0.15, 0.45, 0.75]);
+end
+plot(time, yawUnwrap, '-', 'LineWidth', 1.6, 'Color', [0.55, 0.25, 0.65]);
+xlabel('时间 (s)'); ylabel('偏航角 (deg，已解卷绕)');
+if ~isempty(yawDesUnwrap)
+    title(sprintf('负载偏航角：参考(虚线) vs 实际(实线)  |  跟踪误差 %.1f°rms', ...
+        sqrt(mean((yawUnwrap - yawDesUnwrap).^2))));
+    legend({'参考 yaw', '实际 yaw'}, 'Location', 'best');
+else
+    title('负载偏航角（欠驱动自由轴，见 README §5.1）');
+    legend({'实际 yaw'}, 'Location', 'best');
+end
 end
 
 % ======================================================================
