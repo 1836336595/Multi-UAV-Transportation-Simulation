@@ -77,6 +77,33 @@ cfg = crazyflie_slung_parameters(userCfg);
 
 显式提供 `mass`、`inertia` 或 `rotationalDamping` 时，对应用户值优先。
 
+### 尺寸变化对 yaw 跟踪的影响
+
+负载尺寸不会改变 yaw 参考角，但会改变 yaw 闭环的动力学条件：
+
+- 偏航惯量随尺寸变化：
+
+  \[
+  J_{0z}=\frac{m_0(a^2+b^2)}{12}.
+  \]
+
+- 挂点力臂 `rho_i` 变化，从而改变张力分配矩阵 `P` 和各根缆绳承担的水平张力；
+- 负载包络、缆绳倾角和无人机碰撞裕度发生变化；
+- yaw 增益根据新的 `J0` 自动重算：
+
+  \[
+  k_{R,z}=J_{0z}\omega_{n,z}^2,\qquad
+  k_{\Omega,z}=2\zeta\omega_{n,z}J_{0z}.
+  \]
+
+默认 yaw 目标带宽为 `0.80 Hz`。因此程序会尽量保持相似的归一化 yaw 动态，
+但尺寸变化后仍应重新检查 `steadyYawTrackingError`、`maxYawTrackingError`、
+`minTension` 和碰撞裕度。
+
+若只提供 `payload.size`，质量保持默认值；若同时提供 `payload.density` 而不提供
+`payload.mass`，则按 `mass = density * volume` 自动计算质量。后一种方式会同时改变
+重力、惯量、张力和 yaw 响应，影响更明显。
+
 ## 负载 yaw 控制
 
 负载 yaw 反馈默认开启：
@@ -155,9 +182,10 @@ x_i=x_0+R_0\rho_i-l_iq_i,\qquad \|q_i\|=1.
 ## 修改后检查
 
 1. 修改 `crazyflie_slung_parameters.m` 或通过 `userCfg` 覆盖参数。
-2. 运行 `crazyflie_slung_demo('quick')`。
-3. 检查 yaw 误差、最小张力、无人机间距和机体-负载间隙。
-4. 再运行完整仿真并查看日志和图形。
-5. 提交前运行 `git diff --check`。
+2. MATLAB 中先执行 `clear functions`，避免旧的动力学持久变量影响结果。
+3. 运行 `crazyflie_slung_demo('quick')`。
+4. 检查 yaw 误差、最小张力、无人机间距和机体-负载间隙。
+5. 再运行完整仿真并查看日志和图形。
+6. 提交前运行 `git diff --check` 和 `git status --short`。
 
 本工程只包含本地代码和文档，不包含自动上传 GitHub 的脚本。
