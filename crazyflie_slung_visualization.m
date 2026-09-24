@@ -156,10 +156,10 @@ title('绳索张力（左）与推力占比（右）');
 legend(hThrust, arrayfun(@(i) sprintf('机 %d 推力', i), 1:n, ...
     'UniformOutput', false), 'Location', 'best');
 
-% ---- (6) 负载偏航角（欠驱动自由轴）----
+% ---- (6) 负载偏航角（yaw 跟踪通道）----
 % ★ 这一格原来画"机 1 角速度指令 vs 实测"，但它与自检输出的
 %   "最大机体角速度" 完全重复。负载偏航角才是本仿真最需要被看见的量：
-%   它单调漂移、导致绳向误差缓增、也是三维图里"圆环"的来源。
+%   它直接反映负载 yaw 参考与实际姿态的闭环跟踪结果。
 subplot(2, 3, 6);
 % ★ 同时画【参考 yaw】与【实际 yaw】。参考取仿真时记下的 sim.loadYawRefLog
 %   （= 参考姿态 R0d 第一轴方位角：八字 = 运动方向；定高恒为 0）。
@@ -191,7 +191,7 @@ if ~isempty(yawDesUnwrap)
         sqrt(mean((yawUnwrap - yawDesUnwrap).^2))));
     legend({'参考 yaw', '实际 yaw'}, 'Location', 'best');
 else
-    title('负载偏航角（欠驱动自由轴，见 README §5.1）');
+    title('负载偏航角（yaw 反馈关闭，仅作观测）');
     legend({'实际 yaw'}, 'Location', 'best');
 end
 end
@@ -269,7 +269,7 @@ rotorRadius = cfg.vehicle.rotorRadius * scaleV;
 %   "函数或变量 'armLength' 无法识别"）。
 %
 % ★★★ 但**绝不能靠放大负载**来"看得清"：
-%   挂点画在真实位置（x=±0.10 = 0.20 m 方板的边缘），四旋翼位置也由
+%   挂点画在真实位置（由 payload.size 和 attachFractions 生成），四旋翼位置也由
 %   veh = x0 + R0*rho_i - l*q_i 定死、绳索连到真实挂点。把负载按 k 倍画，
 %   挂点就会落在"板面 1/(2k) 处"，**看起来像挂在板子中间** ——
 %   用户正是据此判断"挂点不在边缘"。所以这里对 k≠1 明确报警。
@@ -347,7 +347,7 @@ payloadPatch = patch(ax, 'Vertices', zeros(8, 3), 'Faces', boxFaces, ...
     'FaceColor', [0.55, 0.72, 0.92], 'FaceAlpha', 1.0, ...
     'EdgeColor', [0.15, 0.35, 0.65], 'LineWidth', 1.0);
 % ★ 机体轴三色线：负载自转时若看不出朝向，视觉上会误以为负载变成了一个圆环。
-%   （本构型偏航是欠驱动自由轴，30 s 内自转约 60 度，四角扫出直径 0.28 m 的圆，
+%   （负载 yaw 误差较大时，30 s 内四角会扫出明显的圆形轨迹；
 %   而负载厚度只有 0.02 m —— 侧视图上那圈就是扫掠轨迹。）
 %   画上三条体轴后，自转方向与转速一眼可见，不会再被误读。
 payloadAxisLines = gobjects(1, 3);
@@ -423,8 +423,7 @@ for k = 1:stride:nSteps
         end
     end
 
-    % ★ 标题里显式给出负载偏航角。偏航是欠驱动自由轴（见 README §5.1），
-    %   它会单调漂移；如果不显示出来，用户只会看到负载在转却不知道原因。
+    % ★ 标题里显式给出负载偏航角，便于核对 yaw 参考与实际姿态是否一致。
     yawNow = atan2(sim.loadRotationLog(2, 1, k), sim.loadRotationLog(1, 1, k));
     set(titleHandle, 'String', sprintf( ...
         ['t = %.2f s | 负载高度 %.3f m | 负载偏航 %.1f deg | ' ...

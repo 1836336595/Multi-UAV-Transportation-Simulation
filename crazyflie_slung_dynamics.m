@@ -115,15 +115,17 @@ for i = 1:n
     zeta_i = uPar - m * l * dot(omegai, omegai) * qi - m * Qi * R0 * hatOm0SqRho;
     rhs1 = rhs1 + zeta_i;
 
-    % (6) 中第 i 机的贡献
-    rhs2 = rhs2 + rhoHat.' * R0.' * zeta_i;
+    % (7) 中第 i 机的贡献（论文原式使用 +hat(rho_i)，不是转置）
+    %   hat(rho_i).' = -hat(rho_i)。误写成转置会把负载受到的
+    %   绳索力矩整体反向，yaw 反馈就会从负反馈变成正反馈。
+    rhs2 = rhs2 + rhoHat * R0.' * zeta_i;
 
     % 各耦合矩阵块
     sumQ = sumQ + m * Qi;
     sumMRho = sumMRho + m * Qi * R0 * rhoHat;
     R0tQi = R0.' * Qi;
-    sumRhoQ = sumRhoQ + m * rhoHat.' * R0tQi;
-    sumRhoQRho = sumRhoQRho + m * rhoHat.' * R0tQi * R0 * rhoHat;
+    sumRhoQ = sumRhoQ + m * rhoHat * R0tQi;
+    sumRhoQRho = sumRhoQRho + m * rhoHat * R0tQi * R0 * rhoHat;
 end
 
 % 论文 (5)：Mq = m0 I + sum_i m_i q_i q_i'
@@ -145,10 +147,10 @@ Mq = m0 * eye(3) + sumQ;
 Mblock = [Mq,        -sumMRho; ...
           sumRhoQ,   J0 - sumRhoQRho];
 % ★★★ 负载**转动阻尼**：作为**外部力矩**加在转动方程右端（不是控制指令）。
-%   转成控制需求会经 "Md -> 张力分配 -> q_id 水平化" 形成正反馈（实测必发散），
-%   而外部力矩直接作用在负载上，绕开控制器 ⇒ 稳定。
+%   它只用于表示气动/结构耗散，不替代论文中的 yaw 反馈控制。
+%   yaw 控制力矩仍由 Md 经张力分配和绳向环交付；二者在动力学中分别体现。
 %   物理来源与取值依据见 crazyflie_slung_parameters.m 中 rotationalDamping 的说明。
-%   作用：压掉"负载偏航 <-> 绳索扭转"那个既不可控又无阻尼的模态。
+%   作用：抑制负载偏航与绳索摆动耦合产生的残余振荡。
 dampingTorque = -cfg.payload.rotationalDamping * Omega0;
 rhsBlock = [rhs1; rhs2 - cross(Omega0, J0 * Omega0) + dampingTorque];
 

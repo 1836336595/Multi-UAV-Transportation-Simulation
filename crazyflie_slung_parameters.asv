@@ -33,8 +33,7 @@ end
 %   这是八字避障工况的值；若退回静态悬停工况（cfg.referenceFcn = []），
 %   建议把时长改回 30 s（悬停收敛需要更长时间）。
 %   历史说明：静态工况下不存在真稳态，位置误差在 t = 30 s 取最小 3.63 mm 后
-%   回升、77.2 s 完全发散（旧版本 yaw 符号和反馈配置错误），故 30 s 仍作为
-%   静态工况的默认展示窗口；当前 yaw 通道默认开启并单独记录跟踪误差。
+%   回升、77.2 s 完全发散（因偏航欠驱动漂移），故 30 s 是静态工况的最优窗口。
 %   dt = 0.002 s 对应 500 Hz。
 cfg.simulation = struct(...
     'duration', 30.0, ...          % 定高悬停 30 s（悬停收敛需要更长时间）
@@ -43,35 +42,23 @@ cfg.simulation = struct(...
     'maxBodyRate', 12.0);          % 机体角速度安全上限 [rad/s]，仅数值保护
 
 % ------------------------------------------------------------------ 负载
-% 悬挂一块长方体平台。n 架四旋翼分别挂在平台上三个不共线的挂点上。
+% 悬挂一块方形平台。n 架四旋翼分别挂在平台上互成 120 度的三个挂点上。
 cfg.payload = struct();
 cfg.payload.mass = 0.080;                          % m0，负载质量 [kg]
-cfg.payload.size = [0.08; 0.06; 0.050];            % [长; 宽; 厚] 长方体外形 [m]
-% 几何派生量在 mergeStruct 后按 size 重新计算。mass 默认独立于尺寸；
-% 若要模拟同材料物品随体积变重，可在 userCfg.payload 中显式提供 density，
-% 并省略 mass，此时质量按 density * volume 自动计算。
-% 下面两个字段是**无量纲几何模板**，实际挂点由 payload.size 自动缩放：
-%   x = +/- a/2，y = 0 或 +/- b/2，z = -c/2（上表面，z 轴向下）。
-%   修改 payload.size 后，挂点仍然落在对应的物品棱/顶面边界上。
-cfg.payload.attachFractions = [ 0.5, -0.5, -0.5; ...
-                                0.0,  0.5, -0.5; ...
-                               -0.5, -0.5, -0.5];
-% 惯量按均质长方体自动计算：
-%   Ixx = m(b^2+c^2)/12, Iyy = m(a^2+c^2)/12, Izz = m(a^2+b^2)/12
-cfg.payload.inertia = boxInertia(cfg.payload.mass, cfg.payload.size); % J0 [kg*m^2]
+cfg.payload.size = [0.20; 0.20; 0.100];            % [长; 宽; 厚] 长方体外形 [m]
+% 惯量按均质长方体：Ixx = m(b^2+c^2)/12, Iyy = m(a^2+c^2)/12, Izz = m(a^2+b^2)/12
+cfg.payload.inertia = diag([2.6933e-4, 2.6933e-4, 5.3333e-4]);   % J0 [kg*m^2]
 
 % ★★★ 负载**转动阻尼**（物理项，非控制项）—— 2026-09-21 新增，必须保留
-%   背景：用户要求的挂点几何（一边中点 + 对边两顶点）可能让挂点几何中心偏离负载质心，
-%         偏移量由 payload.size 和 attachFractions 自动决定。该偏移带来一个
-%         "负载偏航 <-> 绳索扭转"的耦合模态，
+%   背景：用户要求的挂点几何（一边中点 + 对边两顶点）**必然**让挂点质心偏离负载质心
+%         a/3 = 0.0333 m。该偏移带来一个"负载偏航 <-> 绳索扭转"的耦合模态，
 %         频率 ω ≈ sqrt(m0 g offset^2 / (L J0z)) ≈ 2.2 rad/s。
 %         而负载偏航通道必须通过绳索倾斜来交付。修正动力学中的
 %         hat(rho_i) 力矩符号后，yaw 反馈可以恢复为负反馈；转动阻尼仍保留，
 %         用于耗散离散执行器和挂点偏心引起的残余振荡。
 %   解决：把**真实存在的转动阻尼**补进模型。它是**外部力矩**，直接加在负载转动
 %         方程右端，**不经控制器、不进张力分配**，因此不会触发上述正反馈。
-%   取值依据（物理量级估算，不是凑参）：参考负载尺寸由
-%   cfg.payload.rotationalDampingReferenceSize 给出，阻尼随后按水平面积平方缩放。
+%   取值依据（物理量级估算，不是凑参）：边长 a=0.20 m 的方板绕法向以 ω 旋转，
 %         气动阻尼力矩约 (1/8) rho Cd a^4 omega^2；取 rho=1.225、Cd≈1.1、
 %         ω=3 rad/s 得 ≈ 2.4e-3 N*m，等效线性系数 c ≈ 8e-4 N*m*s/rad。
 %         取 1.0e-3（同一量级，略偏保守）。
@@ -79,16 +66,14 @@ cfg.payload.inertia = boxInertia(cfg.payload.mass, cfg.payload.size); % J0 [kg*m
 %         位置跟踪峰值 705.0 mm **完全不变**，推力峰值 69.1% 不变。
 %         c 的有效区间很宽：5e-4 ~ 1e-2 都稳定；>= 5e-2 才会发散（过阻尼+离散化）。
 cfg.payload.rotationalDamping = 1.0e-3;   % [N*m*s/rad] 负载转动阻尼系数
-cfg.payload.rotationalDampingReferenceSize = cfg.payload.size;
-% 挂点（负载体系坐标，z 向下为正，故 z=-c/2 是上表面）。列 = 挂点，
-% 即论文的 rho_i。实际值在文件末尾根据 payload.size 生成。
+% 挂点（负载体系坐标，z 向下为正，故 -0.010 即"上表面"）。列 = 挂点，即论文的 rho_i。
 %
 % ★ 挂点按用户要求放在**物品边缘**（不再放物品中间）：三个点构成一个等腰直角三角形，
-%   其中一点是 x=+a/2 边的中点，另两点是 x=-a/2 边的两个顶点：
-%     rho_1 = ( +a/2,  0,   -c/2 )
-%     rho_2 = ( -a/2, +b/2, -c/2 )
-%     rho_3 = ( -a/2, -b/2, -c/2 )
-%   其中 [a;b;c] = payload.size，因此修改长宽高后挂点自动保持在边界上。
+%   其中一点是某条边的中点，另两点是**对边**的两个顶点。以 x=+0.10、x=-0.10 两条对边为例：
+%     挂点 1 = ( +0.10,  0.00, -0.010)   ← x=+0.10 那条边的中点
+%     挂点 2 = ( -0.10, +0.10, -0.010)   ← x=-0.10 那条边的一个顶点
+%     挂点 3 = ( -0.10, -0.10, -0.010)   ← x=-0.10 那条边的另一个顶点
+%   边长：底边（挂点 2-3）长 0.20 m，腰长 sqrt(0.20^2+0.10^2)=0.2236 m。
 %
 % ★★ 这个几何的两个后果（已数值核算，见 README §11）：
 %   1) **分配矩阵条件数变好**：cond(P*P') 从 276.8 降到 150.2（挂点三角形更大，
@@ -99,8 +84,9 @@ cfg.payload.rotationalDampingReferenceSize = cfg.payload.size;
 %      对应推力占比 [53.3%, 38.6%, 38.6%]（旧值 [43.5% ×3]）。
 %      ⇒ 机 1 的推力需求提高，机 2/3 降低；最小张力 0.1962 N（旧悬停值的 75%），
 %        绳索绷紧裕度相应减小，**必须靠自检确认全程无松弛**。
-cfg.payload.attachPoints = bsxfun(@times, cfg.payload.size(:), ...
-    cfg.payload.attachFractions);
+cfg.payload.attachPoints = [ 0.10, -0.10, -0.10; ...
+                             0.00,  0.10, -0.10; ...
+                            -0.010, -0.010, -0.010];
 
 % ------------------------------------- Crazyflie 2.1 Brushless（真实参数）
 % 质量：含电池、无桨叶保护罩的标称起飞质量 0.0325 kg（Bitcraze 官方规格）。
@@ -127,10 +113,7 @@ cfg.vehicle = struct(...
 %   本仿真全程 mu_i > 0（min 0.1809 N，裕度 69.2 %），故始终处于绷紧段。
 cfg.link = struct(...
     'length', 0.35, ...                            % l_i [m]
-    'count', 3, ...                                 % 与 cfg.vehicle.count 保持一致
-    'allowTiltedCables', true, ...                 % 允许 q_i 不平行于 e3
-    'initialOutwardOffset', NaN, ...                % 初始无人机相对挂点的外张距离 [m]
-    'vehicleClearance', 0.02);                     % 机体中心额外安全间隙 [m]
+    'count', 3);                                   % 与 cfg.vehicle.count 保持一致
 
 % ------------------------------------------- 负载位置/姿态外环（论文 (20)-(21)）
 % ★ 重要：论文 (20) 式的等效质量是 **m0**（负载质量），不是 (m0 + sum m_i)。
@@ -245,9 +228,7 @@ cfg.loadController.designDampingRatio = zetaLoad;
 %   本仿真的实测值：n = 3 时 cond(P*P') = 276.87，rank(P) = 6，条件良好。
 cfg.allocation = struct(...
     'pinvTolerance', 1e-9, ...        % P*P' 求逆前的条件数检查阈值
-    'checkRank', true, ...             % 是否在启动时检查 rank(P) 并给出提示
-    'outwardBiasFraction', 0.20, ...  % 内部张力外张偏置 / (m0*g)
-    'outwardBiasMax', 0.12);           % 每根绳外张偏置的 RMS 上限 [N]
+    'checkRank', true);               % 是否在启动时检查 rank(P) 并给出提示
 
 % ---------------------------------------- 绳向环（论文 (26)-(28)）
 % 论文 (27)：u_perp_i = m_i l_i hat(q_i){ -kq e_qi - kw e_wi - (q_i.omega_id) q_id_dot
@@ -322,10 +303,16 @@ cfg.initial.velocity = zeros(3, 1);
 cfg.initial.rpy = deg2rad([3; -2; 4]);             % 负载初始姿态
 cfg.initial.loadBodyRate = zeros(3, 1);
 
-% 初始绳向在 mergeStruct 后根据挂点、绳长和外张间隙自动生成。
-% q_i 仍定义为“由四旋翼指向负载”，竖直悬停时 q_i = +e3；允许外张时
-% q_i 会带有指向负载中心的水平分量。
-cfg.initial.linkUnits = repmat([0; 0; 1], 1, 3);
+% 各绳索的初始方向：在标称竖直方向（+e3，由四旋翼指向负载）基础上加不同倾角。
+% ★ 绳向符号极易写错：q_i 定义为"由四旋翼指向负载"，悬停时 q_i ≈ +e3，
+%   **不是** -e3。写成 -e3 会让初始构型变成"负载在四旋翼上方"的倒挂状态。
+tilt = deg2rad([4, -5, 3]);                        % 三个各绳各自的初始倾角
+tiltDir = deg2rad([0, 120, 240]);                  % 倾角方向
+cfg.initial.linkUnits = zeros(3, 3);
+for i = 1:3
+    cfg.initial.linkUnits(:, i) = normalizeVector( ...
+        [sin(tilt(i)) * cos(tiltDir(i)); sin(tilt(i)) * sin(tiltDir(i)); cos(tilt(i))]);
+end
 cfg.initial.linkRates = zeros(3, 3);
 
 % 各机初始姿态与角速度
@@ -348,12 +335,12 @@ muHoverInit = [ones(1, cfg.vehicle.count); ...
               [-cfg.payload.mass * cfg.vehicle.gravity; 0; 0];
 cfg.initial.thrustNewton = abs(muHoverInit).' + cfg.vehicle.mass * cfg.vehicle.gravity;
 
-% --------------------------------------------------- 目标点（静态悬停点）
+% --------------------------------------------------- 目标（静态悬停点）
 cfg.target = struct();
 cfg.target.position = [0; 0; -0.35];               % z 向下为正，-0.35 表示升高
 cfg.target.velocity = zeros(3, 1);
 cfg.target.acceleration = zeros(3, 1);
-cfg.target.rpy = deg2rad([0; 0; 9]);
+cfg.target.rpy = deg2rad([0; 0; 0]);
 
 % ------------------------------------------------------------ 期望轨迹
 % ★ 默认工况**由静态悬停改为三阶段八字避障轨迹**（对应论文 Lee 2018 Fig. 3）。
@@ -546,9 +533,9 @@ cfg.obstacles.clearance = 0.05;    % 负载外接球到锥表面的最小允许�
 % ------------------------------------------------------------ 可视化参数
 %
 % ★★★ 负载显示缩放必须为 1.0 —— 这是**几何保真**要求，不是审美偏好。
-%   挂点画在**真实**位置（由 payload.size 和 attachFractions 生成），
+%   挂点画在**真实**位置（x = ±0.10，恰为 0.20 m 方板的边缘），
 %   而四旋翼位置由 veh = x0 + R0*rho_i - l*q_i 决定、绳索连到真实挂点。
-%   若把负载按 2 倍画，挂点就会落在"板面 1/4 处"，
+%   若把负载按 2 倍画（0.40 m 的板），挂点就会落在"板面 1/4 处"，
 %   **看起来像挂在板子中间** —— 用户正是据此判断"挂点没在边缘"。
 %   曾经这里写 2.0（为了在远景 3D 图里看清外形），已被证实会产生误导。
 %   要看大请用 MATLAB 图窗自带的缩放，不要改这个系数。
@@ -594,108 +581,6 @@ end
 % 用户参数覆盖默认值（递归合并）
 cfg = mergeStruct(cfg, userCfg);
 
-% ------------------------------------------------------------------ 尺寸驱动的派生参数
-% payload.size 是几何参数源。除非用户明确给出更高优先级的自定义值，
-% 挂点、惯量、姿态增益和初始推力都在这里重新生成，避免只改尺寸后仍沿用旧系数。
-if cfg.vehicle.count < 3
-    error('crazyflie_slung_parameters:NotEnoughVehicles', ...
-        '本仿真实现的张力分配要求至少 3 架无人机，当前 n = %d。', ...
-        cfg.vehicle.count);
-end
-userHasPayload = isfield(userCfg, 'payload') && isstruct(userCfg.payload);
-userHasMass = userHasPayload && isfield(userCfg.payload, 'mass');
-userHasDensity = userHasPayload && isfield(userCfg.payload, 'density');
-userHasAttachPoints = userHasPayload && isfield(userCfg.payload, 'attachPoints');
-userHasInertia = userHasPayload && isfield(userCfg.payload, 'inertia');
-if numel(cfg.payload.size) ~= 3 || any(cfg.payload.size(:) <= 0)
-    error('crazyflie_slung_parameters:BadPayloadSize', ...
-        'cfg.payload.size 必须是三个正数 [length; width; height]。');
-end
-cfg.payload.size = cfg.payload.size(:);
-if userHasDensity && (~isscalar(cfg.payload.density) ...
-        || ~isfinite(cfg.payload.density) || cfg.payload.density <= 0)
-    error('crazyflie_slung_parameters:BadPayloadDensity', ...
-        'cfg.payload.density 必须是正的有限标量 [kg/m^3]。');
-end
-if userHasDensity && ~userHasMass
-    cfg.payload.mass = cfg.payload.density * prod(cfg.payload.size);
-end
-if ~isscalar(cfg.payload.mass) || ~isfinite(cfg.payload.mass) || cfg.payload.mass <= 0
-    error('crazyflie_slung_parameters:BadPayloadMass', ...
-        'cfg.payload.mass 必须是正的有限标量 [kg]。');
-end
-cfg.payload.volume = prod(cfg.payload.size);
-cfg.payload.surfaceArea = 2 * (cfg.payload.size(1) * cfg.payload.size(2) ...
-    + cfg.payload.size(1) * cfg.payload.size(3) ...
-    + cfg.payload.size(2) * cfg.payload.size(3));
-cfg.payload.boundingRadius = 0.5 * norm(cfg.payload.size);
-if userHasMass || ~userHasDensity || ~isfield(cfg.payload, 'density')
-    cfg.payload.density = cfg.payload.mass / cfg.payload.volume;
-end
-if size(cfg.payload.attachFractions, 1) ~= 3
-    error('crazyflie_slung_parameters:BadAttachFractions', ...
-        'cfg.payload.attachFractions 必须是 3 x n 矩阵。');
-end
-if size(cfg.payload.attachFractions, 2) ~= cfg.vehicle.count
-    error('crazyflie_slung_parameters:AttachFractionMismatch', ...
-        'attachFractions 列数 (%d) 必须等于四旋翼数量 (%d)。', ...
-        size(cfg.payload.attachFractions, 2), cfg.vehicle.count);
-end
-if ~userHasAttachPoints
-    cfg.payload.attachPoints = bsxfun(@times, cfg.payload.size(:), ...
-        cfg.payload.attachFractions);
-end
-if ~userHasInertia
-    cfg.payload.inertia = boxInertia(cfg.payload.mass, cfg.payload.size);
-end
-if size(cfg.payload.attachPoints, 1) ~= 3
-    error('crazyflie_slung_parameters:BadAttachPoints', ...
-        'cfg.payload.attachPoints 必须是 3 x n 矩阵。');
-end
-
-% 若用户没有手动指定惯量阻尼，则根据尺寸更新负载的派生物理系数。
-if ~isfield(cfg.payload, 'rotationalDampingReferenceSize')
-    cfg.payload.rotationalDampingReferenceSize = [0.08; 0.06; 0.050];
-end
-userHasDamping = userHasPayload && isfield(userCfg.payload, 'rotationalDamping');
-if ~userHasDamping
-    refSize = cfg.payload.rotationalDampingReferenceSize(:);
-    areaScale = (cfg.payload.size(1) * cfg.payload.size(2) ...
-        / (refSize(1) * refSize(2)))^2;
-    cfg.payload.rotationalDamping = 1.0e-3 * areaScale;
-end
-
-% 姿态增益按新的 J0 重算；用户显式给出的 kR/kOmega 保留。
-userHasLoadController = isfield(userCfg, 'loadController') ...
-    && isstruct(userCfg.loadController);
-userHasKR = userHasLoadController && isfield(userCfg.loadController, 'kR');
-userHasKOmega = userHasLoadController && isfield(userCfg.loadController, 'kOmega');
-wnLoad = 2 * pi * cfg.loadController.designBandwidthHz(:);
-zetaLoad = cfg.loadController.designDampingRatio;
-if ~userHasKR
-    cfg.loadController.kR = diag(cfg.payload.inertia) .* wnLoad.^2;
-end
-if ~userHasKOmega
-    cfg.loadController.kOmega = 2 * zetaLoad .* wnLoad .* diag(cfg.payload.inertia);
-end
-
-% 允许无人机在挂点外侧悬挂，而不是强制位于挂点正上方。
-if isempty(cfg.link.initialOutwardOffset) || ~isscalar(cfg.link.initialOutwardOffset) ...
-        || ~isfinite(cfg.link.initialOutwardOffset)
-    cfg.link.initialOutwardOffset = cfg.vehicle.armLength ...
-        + cfg.vehicle.rotorRadius + cfg.link.vehicleClearance;
-end
-cfg.link.initialOutwardOffset = min(max(cfg.link.initialOutwardOffset, 0), ...
-    0.85 * cfg.link.length);
-if ~isfield(cfg.vehicle, 'collisionRadius') || isempty(cfg.vehicle.collisionRadius)
-    cfg.vehicle.collisionRadius = cfg.vehicle.armLength + cfg.vehicle.rotorRadius;
-end
-userHasInitial = isfield(userCfg, 'initial') && isstruct(userCfg.initial);
-userHasInitialLinks = userHasInitial && isfield(userCfg.initial, 'linkUnits');
-userHasInitialRates = userHasInitial && isfield(userCfg.initial, 'linkRates');
-userHasInitialBodyRates = userHasInitial && isfield(userCfg.initial, 'bodyRates');
-userHasInitialThrust = userHasInitial && isfield(userCfg.initial, 'thrustNewton');
-
 % 用户只改 rpy 时自动重算旋转矩阵
 if ~isfield(userCfg, 'initial') || ~isfield(userCfg.initial, 'rpy')
     cfg.initial.R0 = rpyToRotm(cfg.initial.rpy);
@@ -705,19 +590,8 @@ end
 if ~isfield(cfg.initial, 'R0')
     cfg.initial.R0 = rpyToRotm(cfg.initial.rpy);
 end
-if ~userHasInitialLinks
-    if cfg.link.allowTiltedCables
-        cfg.initial.linkUnits = defaultLinkUnits(cfg.payload.attachPoints, ...
-            cfg.link.length, cfg.link.initialOutwardOffset, cfg.initial.R0);
-    else
-        cfg.initial.linkUnits = repmat([0; 0; 1], 1, cfg.vehicle.count);
-    end
-end
-if ~userHasInitialRates
-    cfg.initial.linkRates = zeros(3, cfg.vehicle.count);
-end
-if ~userHasInitialBodyRates
-    cfg.initial.bodyRates = zeros(3, cfg.vehicle.count);
+if ~isfield(cfg.initial, 'linkUnits') || isempty(cfg.initial.linkUnits)
+    cfg.initial.linkUnits = repmat([0; 0; 1], 1, cfg.vehicle.count);
 end
 cfg.target.R0 = rpyToRotm(cfg.target.rpy);
 
@@ -742,62 +616,12 @@ if size(cfg.payload.attachPoints, 2) ~= cfg.vehicle.count
         '挂点数 (%d) 必须等于四旋翼数量 (%d)。', ...
         size(cfg.payload.attachPoints, 2), cfg.vehicle.count);
 end
-if ~userHasInitialThrust
-    rhoInit = cfg.payload.attachPoints;
-    muHoverInit = [ones(1, cfg.vehicle.count); ...
-                   rhoInit(2, :); ...
-                  -rhoInit(1, :)] \ ...
-                   [-cfg.payload.mass * cfg.vehicle.gravity; 0; 0];
-    % 初始推力按当前 q_i 的向量方向估计。q_i = +e3 时退化为
-    % |mu_i| + m_i*g；允许外张时会自动包含所需的水平推力分量。
-    e3 = [0; 0; 1];
-    qInit = cfg.initial.linkUnits;
-    thrustInit = zeros(1, cfg.vehicle.count);
-    for i = 1:cfg.vehicle.count
-        qi = normalizeVector(qInit(:, i));
-        thrustVector = -abs(muHoverInit(i)) * qi ...
-            - cfg.vehicle.mass * cfg.vehicle.gravity * e3;
-        thrustInit(i) = norm(thrustVector);
-    end
-    cfg.initial.thrustNewton = thrustInit;
-end
 cfg.link.count = cfg.vehicle.count;
 end
 
 % ======================================================================
 % 局部工具函数（详见 README §1.1：MATLAB 局部函数是文件私有的）
 % ======================================================================
-function J = boxInertia(mass, sizeXYZ)
-%BOXINERTIA 均质长方体绕质心的惯量矩阵。
-sizeXYZ = sizeXYZ(:);
-a = sizeXYZ(1); b = sizeXYZ(2); c = sizeXYZ(3);
-J = diag([mass * (b^2 + c^2) / 12; ...
-          mass * (a^2 + c^2) / 12; ...
-          mass * (a^2 + b^2) / 12]);
-end
-
-function qAll = defaultLinkUnits(rhoAll, linkLength, outwardOffset, R0)
-%DEFAULTLINKUNITS 依据挂点径向方向生成外张的初始绳向。
-% q_i 从无人机指向负载；无人机向挂点外侧偏移时，q_i 的水平分量指向内侧。
-n = size(rhoAll, 2);
-qAll = zeros(3, n);
-for i = 1:n
-    radialBody = [rhoAll(1, i); rhoAll(2, i); 0];
-    radialNorm = norm(radialBody);
-    if radialNorm < 1e-12
-        angle = 2 * pi * (i - 1) / max(n, 1);
-        radialBody = [cos(angle); sin(angle); 0];
-    else
-        radialBody = radialBody / radialNorm;
-    end
-    horizontalRatio = min(outwardOffset / max(linkLength, eps), 0.85);
-    qBody = [-horizontalRatio * radialBody(1); ...
-             -horizontalRatio * radialBody(2); ...
-              sqrt(max(1 - horizontalRatio^2, 0))];
-    qAll(:, i) = normalizeVector(R0 * qBody);
-end
-end
-
 function R = rpyToRotm(rpy)
 % ZYX 欧拉角顺序，与 v2 保持一致的接口。
 roll = rpy(1); pitch = rpy(2); yaw = rpy(3);

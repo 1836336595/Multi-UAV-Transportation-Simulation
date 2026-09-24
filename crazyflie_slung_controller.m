@@ -73,24 +73,24 @@ Fd = m0 * (-cfg.loadController.kx .* ex ...
     + desired.acceleration(:) - g * e3);
 
 % 论文 (21)：负载姿态误差与角速度误差，以及期望合力矩 Md
-% ★★★ 关于偏航（第 3）通道：cfg.loadController.kR(3) 与 kOmega(3) 被置零。
-%   经系统辨识确认：只要这两个增益之一非零，闭环就发散（详见参数文件
-%   中"偏航通道必须关闭"的完整机理说明与实测数据）。物理原因是
-%   "近似竖直绳索 + 水平面内挂点"构型下，偏航力矩需求会变成张力的纯水平
-%   分量，而该分量既无法被 (27) 的投影交付为力矩（实测交付率 24.9% -> 0%），
-%   又会把期望绳向 q_id 甩向水平，形成纯正反馈。
-%   因此这里 kR .* eR0 与 kOmega .* eOmega0 的第 3 个分量自动为 0，
-%   Md 的偏航分量也随之为 0 —— 无需额外分支，但务必保留本注释以免后人误改。
+% 负载姿态误差采用 SO(3) 几何误差。yaw 是否参与控制由
+% cfg.loadController.yawChannelEnabled 显式决定。当前默认配置开启低带宽
+% yaw 反馈；Md(3) 通过张力分配和绳向环产生负载偏航恢复力矩。
 R0d = desired.rotation;
 Omega0d = desired.bodyRate(:);
 Omega0dDot = desired.bodyRateDot(:);
 eR0 = 0.5 * vee(R0d.' * R0 - R0.' * R0d);
 eOmega0 = Omega0 - R0.' * R0d * Omega0d;
 feedforwardRate = R0.' * R0d * Omega0d;
-Md = -cfg.loadController.kR .* eR0 - cfg.loadController.kOmega .* eOmega0 ...
+MdRaw = -cfg.loadController.kR .* eR0 - cfg.loadController.kOmega .* eOmega0 ...
     + hat(feedforwardRate) * J0 * feedforwardRate ...
     + J0 * R0.' * R0d * Omega0dDot;
 
+Md = MdRaw;
+if ~isfield(cfg.loadController, 'yawChannelEnabled') || ...
+        ~cfg.loadController.yawChannelEnabled
+    Md(3) = 0;
+end
 % 期望负载角加速度 Omega0_dot_cmd：由 (21) 的力矩反解
 %   J0 Omega0_dot = Md - Omega0 x J0 Omega0 + (耦合项)
 % 我们只需要一个**本拍可得、无延迟**的 Omega0_dot 估计来构造 a_i，
@@ -112,20 +112,33 @@ PPt = P * P.';
 % ★ 注意 rcond 的语义：rcond(PPt) = 1/cond(PPt)。
 %   本仿真实测 cond(P P') = 276.87，故 rcond ≈ 3.6e-3，
 %   远大于 pinvTolerance = 1e-9，检查通过。
-%   若把挂点摆到同一水平面上（rho_z = 0），rank(P) 会掉到 5，
-%   PPt 奇异，rcond -> 0，此处会直接报错——这正是这个检查要防的情况。
+%   挂点是否处于同一水平面并不决定秩；关键是 n >= 3 且挂点不共线。
+%   只有挂点共线时 rank(P) 才会下降，PPt 才可能奇异。
 if cfg.allocation.checkRank
     if rcond(PPt) < cfg.allocation.pinvTolerance
         error('crazyflie_slung_controller:SingularAllocation', ...
             ['分配矩阵奇异：rcond(P*P'') = %.3e（= 1/cond，本构型应为 3.6e-3 量级）。' ...
-             '请确认 n >= 3、挂点不共线、且挂点的 z 分量不全为 0。'], rcond(PPt));
+             '请确认 n >= 3 且挂点不共线。'], rcond(PPt));
     end
 end
 
 rhs6 = [R0.' * Fd; Md];
 % PPt \ rhs6 等价于 inv(PPt)*rhs6，但数值上更稳。
 % diag[R0,...,R0] 用 kron(eye(n), R0) 构造。
-muDesiredAll = reshape(kron(eye(n), R0) * (P.' * (PPt \ rhs6)), 3, n);
+muBody = P.' * (PPt \ rhs6);
+
+% 最小范数解只负责满足总合力/总力矩，悬停时会让绳索尽量接近竖直。
+% 对小尺寸负载，这会让无人机中心过度聚拢。利用 P 的零空间加入内部
+% “外张”力：P * muInternal = 0，因此不改变负载需要的 Fd/Md，只改变
+% 各根绳的方向和无人机间距。该项是可配置的，置 0 即恢复论文的最小范数解。
+internalBiasBody = zeros(3 * n, 1);
+if isfield(cfg.link, 'allowTiltedCables') && cfg.link.allowTiltedCables ...
+        && isfield(cfg.allocation, 'outwardBiasFraction')
+    internalBiasBody = outwardInternalBias(P, rhoAll, m0, g, ...
+        cfg.allocation.outwardBiasFraction, cfg.allocation.outwardBiasMax);
+    muBody = muBody + internalBiasBody;
+end
+muDesiredAll = reshape(kron(eye(n), R0) * muBody, 3, n);
 
 % ======================================================================
 % (3)(4) 逐机：平行分量 (17) 与绳向环 (27)
@@ -253,8 +266,9 @@ omegaCmdAll = zeros(3, n);
 
 % (37) 期望姿态 R_ic 的第一轴参考方向 b1d。
 %   'reference' = 论文原式（取 R0d 第一轴）；'worldX' = 机体航向锁定世界 +x。
-% ★ 机体航向跟着负载参考 yaw 转 ⇒ 挂点方位转动 ⇒ 拧绳 ⇒ 反过来激励负载偏航
-%   （不可控、无法耗散）⇒ 抖动被放大。四旋翼 yaw 与推力**解耦**，代价为零。
+% ★ 机体航向跟着负载参考 yaw 转时，挂点方位也随之变化；因此动态参考下
+%   需要保证绳向环和负载 yaw 环带宽匹配。四旋翼自身 yaw 与推力方向解耦，
+%   这里的 headingSource 只选择机体绕推力轴的姿态参考，不会关闭负载 yaw 环。
 %   实测（八字）：偏航率抖幅 std 0.0498 → 0.0269 rad/s，终端残差 94.0 → 90.0 mm。
 % ★ 定高工况下 R0d ≡ cfg.target.R0（第一轴 = +x），两者**完全等价**。
 if isfield(cfg.attitudeController, 'headingSource') ...
@@ -338,6 +352,7 @@ command.desiredMoment = Md;
 command.desiredLinkUnits = desiredLinkAll;
 command.linkDirectionErrors = eqAll;
 command.desiredTensions = muDesiredAll;      % 分配结果 mu_id（3 x n）
+command.internalTensionBias = reshape(kron(eye(n), R0) * internalBiasBody, 3, n);
 command.tensions = zeros(1, n);              % 实际张力 = ||mu_i||，mu_i = q_i q_i' mu_id
 for i = 1:n
     qi = normalizeVector(Qall(:, i));
@@ -400,4 +415,35 @@ end
 
 function value = clampVector(value, lowerBound, upperBound)
 value = min(max(value, lowerBound), upperBound);
+end
+
+function bias = outwardInternalBias(P, rhoAll, mass, gravity, fraction, maxRms)
+%OUTWARDINTERNALBIAS 构造不改变总 wrench 的径向内部张力。
+n = size(rhoAll, 2);
+desired = zeros(3, n);
+for i = 1:n
+    radial = [rhoAll(1, i); rhoAll(2, i); 0];
+    radialNorm = norm(radial);
+    if radialNorm < 1e-12
+        angle = 2 * pi * (i - 1) / max(n, 1);
+        radial = [cos(angle); sin(angle); 0];
+    else
+        radial = radial / radialNorm;
+    end
+    desired(:, i) = fraction * mass * gravity / sqrt(n) * radial;
+end
+
+% 投影到 null(P)，所以 P*bias = 0，合力和合力矩严格不变。
+nullBasis = null(P);
+if isempty(nullBasis)
+    bias = zeros(3 * n, 1);
+    return
+end
+bias = nullBasis * (nullBasis.' * desired(:));
+biasBlocks = reshape(bias, 3, n);
+biasRms = sqrt(mean(sum(biasBlocks.^2, 1)));
+targetRms = min(fraction * mass * gravity / sqrt(n), maxRms);
+if biasRms > 1e-12 && targetRms > 0
+    bias = bias * (targetRms / biasRms);
+end
 end
