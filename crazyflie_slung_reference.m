@@ -178,57 +178,36 @@ switch phase
 end
 
 % ------------------------------------------------ 期望姿态（论文 R0d 构造）
-% 论文原式：第一轴 = **运动方向**，第三轴 = 重力方向 e3。
+% 论文原式：第一轴 = 路径**切线方向**，第三轴 = 重力方向 e3。
 %
-% ★★★ 期望偏航 = **参考轨迹的实际运动方向**，并在 |v|→0 处平滑过渡。
-%   ------------------------------ 为什么不能用"理想切向" --------------------
-%   实际速度 v = env'·p_hat + env·s·v_hat；在包络过渡段（前/后 blendTime 秒）
-%   |v|→0 时被 **env'·p_hat** 主导 ⇒ 真实运动是**径向**，而理想切向是**切向**。
-%   实测两者在过渡段最大差 93.1° / 162.7° / 178.3°（τ=3.0 / 43.0 / 44.5 s），
-%   表现就是"偏航有时朝运动方向、有时正好相反"。
-%   ------------------------------ 为什么不能"直接取 atan2(vy,vx)" -----------
-%   巡航两端 |v|→0，方向会**翻转**：实测 t=47.982 s 处 psi 由 +179.98°
-%   一步跳到 0°（|v| 仅 1e-6）；起飞段 |v| 很小而实际方向是 149°。
-%   这就是"朝向正负不一致 / 符号不稳定"。
-%   ------------------------------ 做法 ---------------------------------------
-%   令 w = v + epsV * t_hat_unit（t_hat = 夹紧 tau 后的理想切向单位向量），
-%   取 psi = atan2(w_y, w_x)：
-%     |v| >> epsV ⇒ w ≈ v         ⇒ **就是实际运动方向**（满足"朝运动方向"）
-%     |v| → 0    ⇒ w ≈ epsV·t_hat ⇒ 平滑接到过渡方向，不跳 180°
-%   ★ tau 已被夹到 [0, tEnd]（起飞段 = 0、降落段 = tEnd），故起飞/降落/巡航两端的
-%     t_hat 都恰好是 +x，**过渡方向与相邻段天然一致**。
-%   epsV = 1e-4 m/s，远小于巡航典型速度 ~0.5 m/s，故不影响正常段。
-%   ★ 实测（Python 镜像，全程 52 s）：
-%       |v| > 0.02 时与真实运动方向的最大差 = **0.147°**（即"就是实际运动方向"）；
-%       仅在"负载近乎静止"的两端（|v| < 1e-3，约 0.02 s 窗口）出现一次快速转向
-%       —— 这是"速度为零时方向本身无定义"的固有代价，不是实现缺陷。
-%       若必须要像素级连续，可对 psi 做时间低通（需引入状态），当前不做。
-%   psi_dot 用解析式 d/dt atan2(w_y, w_x) = (w_x·a_y − w_y·a_x)/(w_x²+w_y²)
-%   （忽略 epsV 偏置项自身的导数；其中 |v| >> epsV 处为精确值）。
-if fe.lockYaw || phase ~= 1
-    psiYaw = 0;  psiDot = 0;  psiDotDot = 0;
+% ★★★ 切线方向取**理想八字（不含包络）的解析切向**，而不是"实际速度方向"。
+%   为什么不能用实际速度方向：
+%     v = env'·p̂ + env·s·v̂，在环绕段两端 env→0 且 env'→0 ⇒ |v|→0 ⇒ **方向退化**；
+%     起飞/降落段是竖直+水平归位，其速度方向与环绕段起点/终点的切向也不一致。
+%   理想切向的两个分量
+%       u(τ) = aX·wX·cos(wX τ)、v(τ) = (aY/2)·wY·sin(wY τ)
+%   **不会同时为零**（wX = 2 wY，联立要求 k = 2m − 1/2，无整数解），
+%   且 τ = 0 与 τ = tEnd 处 v = 0、u > 0 ⇒ ψ = 0，**与起飞/降落段天然连续**。
+%   ⇒ 解析、全程良定义、且拼接连续。
+%
+% 因 b3d ≡ e3，R0d = Rz(ψ) 是**绕世界 z 的纯偏航** ⇒
+%   Omega0d = [0; 0; psiDot]，Omega0dDot = [0; 0; psiDotDot]（体系与世界系一致）。
+%   ★ 这比对 R0d 做**二阶**中心差分干净得多（现在只对解析的 psiDot 做一阶差分）。
+%
+%   lockYaw = true 时 ψ ≡ 0（期望偏航锁定为 0），Omega0d = Omega0dDot = 0。
+if fe.lockYaw
+    psiYaw = 0;
+    psiDot = 0;
+    psiDotDot = 0;
+elseif phase == 1
+    [psiYaw, psiDot, psiDotDot] = yawFromIdealTangent( ...
+        tau, s, max(cfg.simulation.dt, 1e-4), aX, aY, wX, wY);
 else
-    tauClamped = min(max(tau, 0), fe.cycles * 2 * pi / fe.omegaY);
-    tHatX = aX * wX * cos(wX * tauClamped);
-    tHatY = 0.5 * aY * wY * sin(wY * tauClamped);
-    tNorm = hypot(tHatX, tHatY);
-    if tNorm > 0
-        tHatX = tHatX / tNorm;
-        tHatY = tHatY / tNorm;
-    end
-    epsV = 1e-4;
-    wx = velocity(1) + epsV * tHatX;
-    wy = velocity(2) + epsV * tHatY;
-    den = wx^2 + wy^2;
-    psiYaw = atan2(wy, wx);
-    if den > 1e-18
-        psiDot = (wx * acceleration(2) - wy * acceleration(1)) / den;
-    else
-        psiDot = 0;
-    end
-    h = max(cfg.simulation.dt, 1e-4);
-    psiDotDot = (linkYawRateAt(t + h, T1, T2, fe) ...
-               - linkYawRateAt(t - h, T1, T2, fe)) / (2 * h);
+    % 起飞 / 降落段：保持 ψ = 0。理由：理想切向在 τ=0 与 τ=tEnd 处恰为 +x（ψ=0），
+    % 所以这样接出来的 ψ(t) 在全时段连续，且不会在"水平速度过零"处产生奇点。
+    psiYaw = 0;
+    psiDot = 0;
+    psiDotDot = 0;
 end
 b1d = [cos(psiYaw); sin(psiYaw); 0];
 b2d = [-sin(psiYaw); cos(psiYaw); 0];
@@ -245,35 +224,29 @@ bodyRateDot = bodyRateDot(:);
 end
 
 % ======================================================================
-function [vxy, axy] = cruiseHorizontalState(t, T1, T2, fe)
-%CRUISEHORIZONTALSTATE 环绕段在真实时间 t 处的**水平**速度与加速度（惯性系）。
-% ★ 供 linkYawRateAt 求 psiDotDot 的中心差分使用；本函数与主函数 case 1 的
-%   公式**必须逐式一致**（这里单独重算一次是为了避免递归调用主函数）。
-aX = fe.amplitudeX;  aY = fe.amplitudeY;
-wX = fe.omegaX;      wY = fe.omegaY;
-tEnd = fe.cycles * 2 * pi / wY;
-s = tEnd / T2;
-tau = (t - T1) * s;
-pHatX = aX * sin(wX * tau);           pHatY = 0.5 * aY * (1 - cos(wY * tau));
-vHatX = aX * wX * cos(wX * tau);      vHatY = 0.5 * aY * wY * sin(wY * tau);
-cHatX = -aX * wX^2 * sin(wX * tau);   cHatY = 0.5 * aY * wY^2 * cos(wY * tau);
-[env, envDot, envDDot] = blendEnvelope(t - T1, T2, fe.blendTime);
-vxy = [envDot * pHatX + env * s * vHatX; ...
-       envDot * pHatY + env * s * vHatY];
-axy = [envDDot * pHatX + 2 * envDot * s * vHatX + env * s^2 * cHatX; ...
-       envDDot * pHatY + 2 * envDot * s * vHatY + env * s^2 * cHatY];
+function [psi, psiDot, psiDotDot] = yawFromIdealTangent(tau, s, h, aX, aY, wX, wY)
+% 理想八字（不含包络）的切向偏航角及其一/二阶**真实时间**导数。
+%
+%   psi       = atan2(v, u)，  u = aX wX cos(wX tau)， v = (aY/2) wY sin(wY tau)
+%   dpsi/dtau = (u v' - v u') / (u^2 + v^2)      （u'、v' 对 tau 求导，解析）
+%   psiDot    = dpsi/dtau * s                    （链式法则 d/dt = s d/dtau）
+%   psiDotDot = 对**解析的** psiDot 再做一次中心差分
+%               （只一阶；比"对 R0d 做二阶差分"的噪声小一个量级）
+[psi, psiDot] = yawPsiAndRate(tau, s, aX, aY, wX, wY);
+[~, pPlus]  = yawPsiAndRate(tau + s * h, s, aX, aY, wX, wY);
+[~, pMinus] = yawPsiAndRate(tau - s * h, s, aX, aY, wX, wY);
+psiDotDot = (pPlus - pMinus) / (2 * h);
 end
 
 % ======================================================================
-function d = linkYawRateAt(t, T1, T2, fe)
-%LINKYAWRATEAT 环绕段的 psiDot（解析式），供其中心差分求 psiDotDot。
-[v, a] = cruiseHorizontalState(t, T1, T2, fe);
-den = v(1)^2 + v(2)^2;
-if den > 1e-12
-    d = (v(1) * a(2) - v(2) * a(1)) / den;
-else
-    d = 0;
-end
+function [psi, psiDot] = yawPsiAndRate(tau, s, aX, aY, wX, wY)
+% 上面那个函数的解析部分（中心差分需要重复调用它）。
+u  = aX * wX * cos(wX * tau);
+v  = 0.5 * aY * wY * sin(wY * tau);
+uP = -aX * wX^2 * sin(wX * tau);
+vP = 0.5 * aY * wY^2 * cos(wY * tau);
+psi = atan2(v, u);
+psiDot = ((u * vP - v * uP) / max(u^2 + v^2, eps)) * s;
 end
 
 % ======================================================================

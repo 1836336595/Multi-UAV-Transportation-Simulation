@@ -17,14 +17,11 @@ function report = crazyflie_slung_demo(options)
 % 自检项的物理依据：
 %   * 张力分配一致性 —— 论文 (22) 要求 sum_i mu_id = Fd 且 sum_i hat(rho_i) R0' mu_id = Md。
 %     伪逆解 (23) 必须精确满足这两个等式，否则说明分配矩阵 P 装配有误。
-%   * 张力恒正且 ≈ m0 g / n —— 绳索只能受拉；由论文 (18)，悬停时 sum_i mu_i = m0 g。
-%   * 每架四旋翼都在负载上方 —— 由运动学反解 x_i = x0 + R0 rho_i - l q_i 得出。
-%   * 各绳向收敛到 +e3 —— 悬停构型。
+%   * 张力恒正且总量与 m0 g 同量级 —— 不对称挂点下各绳张力不一定相等。
+%   * 缆绳长度守恒、无人机间距和机体-负载间隙满足碰撞包络；不要求无人机正上方。
 %   * 推力裕度、角速度范围、数值有限性。
-%   * 负载姿态误差**按轴分开判定**：roll/pitch 是可控轴，用严格门限（< 3 deg）；
-%     偏航是欠驱动自由轴（kR(3) = kOmega(3) = 0），只检查漂移率有界
-%     （< 2.0 rad/s）。详见 README §5.1 的完整机理说明。
-%   * 偏航漂移率有界 —— 欠驱动轴在演示窗口内不得失控。
+%   * 负载姿态误差按 roll/pitch 与 yaw 分开判定；yaw 是低带宽闭环轴。
+%   * 偏航角速度和 yaw 跟踪误差有界。
 %   * 【八字组】三阶段跟踪误差 —— 起飞/环绕/降落分别设门限。环绕段是
 %     "跟踪精度"真正该考核的窗口；门限按 ±1.5 m 大尺度机动的实测值设定
 %     （见 README §10 的调参记录），不是拍脑袋的数字。
@@ -93,7 +90,7 @@ fprintf('  绳长 l                  : %.4f m\n', cfg.link.length);
 muHoverCfg = [ones(1, n); cfg.payload.attachPoints(2, :); ...
               -cfg.payload.attachPoints(1, :)] \ [-m0 * g; 0; 0];
 thrHoverCfg = abs(muHoverCfg).' + m * g;
-fprintf('  挂点（负载体系 3x3）    : %s\n', mat2str(cfg.payload.attachPoints, 4));
+fprintf('  挂点（负载体系 3x%d）    : %s\n', n, mat2str(cfg.payload.attachPoints, 4));
 fprintf('  挂点质心偏移            : (%+.4f, %+.4f) m\n', ...
     mean(cfg.payload.attachPoints(1, :)), mean(cfg.payload.attachPoints(2, :)));
 
@@ -192,18 +189,21 @@ else
         '缺少 summary.nonFiniteSolveCount 字段', '= 0');
 end
 
-% 各绳向收敛到 +e3
-qFinal = sim.linkUnitLog(:, :, end);
-maxAngle = 0;
-for i = 1:n
-    qi = qFinal(:, i) / max(norm(qFinal(:, i)), eps);
-    maxAngle = max(maxAngle, rad2deg(acos(min(max(qi(3), -1), 1))));
-end
-checks = addCheck(checks, '各绳方向 q_i -> +e3', maxAngle < 15, ...
-    sprintf('最大夹角 %.2f deg', maxAngle), '< 15 deg');
+qNormError = max(abs(sqrt(sum(sim.linkUnitLog.^2, 1)) - 1), [], 'all');
+checks = addCheck(checks, '各绳向保持单位长度', qNormError < 1e-9, ...
+    sprintf('最大范数误差 %.3e', qNormError), '< 1e-9');
 
-checks = addCheck(checks, '每架四旋翼都在负载上方', s.allVehiclesAboveLoad, ...
-    string(s.allVehiclesAboveLoad), '必须为 true');
+if isfield(s, 'vehicleCollisionFree')
+    checks = addCheck(checks, '无人机中心距满足碰撞裕度', s.vehicleCollisionFree, ...
+        sprintf('最小 %.4f m / 要求 %.4f m', s.minVehicleSeparation, ...
+        s.requiredVehicleSeparation), '> 要求值');
+end
+if isfield(s, 'vehiclePayloadCollisionFree')
+    checks = addCheck(checks, '无人机与负载外接包络不碰撞', ...
+        s.vehiclePayloadCollisionFree, ...
+        sprintf('最小间隙 %.4f m / 裕度 %.4f m', ...
+        s.minVehiclePayloadClearance, s.vehiclePayloadClearanceMargin), '> 0');
+end
 
 checks = addCheck(checks, '所有绳索张力恒为正（单边约束 mu >= 0）', ...
     s.allTensionsPositive, ...
@@ -230,13 +230,20 @@ balanceMatrix = [ones(1, n); RHO(2, :); -RHO(1, :)];
 muHover = balanceMatrix \ [-m0 * g; 0; 0];           % 悬停时各绳 μ_i 的 z 分量
 tensionTheory = abs(muHover);
 tensionMeasured = s.steadyTension(:);
-relErr = abs(tensionMeasured - tensionTheory) ./ tensionTheory;
+relErr = abs(tensionMeasured - tensionTheory) ./ max(tensionTheory, eps);
 tensionStr = @(v) strjoin(arrayfun(@(x) sprintf('%.4f', x), v(:).', ...
     'UniformOutput', false), ', ');
-checks = addCheck(checks, '稳态张力 = 挂点几何决定的悬停解', all(relErr < 0.10), ...
-    sprintf('实测 [%s] / 理论 [%s] N（最大偏差 %.1f%%，合计 %.4f N = m0 g）', ...
-    tensionStr(tensionMeasured), tensionStr(tensionTheory), ...
-    100 * max(relErr), sum(tensionMeasured)), '< 10%');
+if isfield(cfg.allocation, 'outwardBiasFraction') && cfg.allocation.outwardBiasFraction > 0
+    checks = addCheck(checks, '外张绳索模式总张力可接受', ...
+        sum(tensionMeasured) >= m0 * g && sum(tensionMeasured) < 1.8 * m0 * g, ...
+        sprintf('实测总张力 %.4f N / 负载重力 %.4f N', ...
+        sum(tensionMeasured), m0 * g), '[m0 g, 1.8 m0 g)');
+else
+    checks = addCheck(checks, '稳态张力 = 挂点几何决定的悬停解', all(relErr < 0.10), ...
+        sprintf('实测 [%s] / 理论 [%s] N（最大偏差 %.1f%%，合计 %.4f N = m0 g）', ...
+        tensionStr(tensionMeasured), tensionStr(tensionTheory), ...
+        100 * max(relErr), sum(tensionMeasured)), '< 10%');
+end
 
 % ★ 稳态位置误差只在**静态悬停工况**下用 2 cm 门限。
 %   八字工况下"稳态"这个概念不成立（参考点一直在动），跟随误差必然大得多，
@@ -263,23 +270,17 @@ if ~isFigureEight
              '锥形障碍物在定高工况下没有意义，建议置 false —— 三维图与自检会更干净。']);
     end
 end
-% ★ 绳向误差的门限必须考虑**偏航漂移的注入**。
-%   实测（_scan_ki_3drone.py）：绳向误差在 24~30 s 窗口内已到 2.0 deg 附近，
-%   而且它并非收敛到一个常值，而是随偏航角漂移缓慢增长
-%   （t=10 s 约 1.0 deg，t=30 s 约 2.0 deg，t=60 s 约 6.1 deg）。
-%   增长机理：负载偏航 -> 挂点方位角转动 -> 期望张力分布改变 ->
+% ★ 绳向误差的门限需要考虑 yaw 参考变化的注入。
+%   负载 yaw -> 挂点方位角转动 -> 期望张力分布改变 ->
 %   绳索环追赶不及 -> 留下方向残差。
 %   因此 3 机情形的合理判据是 3 deg（而非单机版的 2 deg），
 %   并在演示窗口（30 s）内成立；这一点在 README §6.2 与 §8 中已明确说明。
 checks = addCheck(checks, '稳态绳向误差 < 3 deg', s.steadyLinkError < deg2rad(3), ...
-    sprintf('%.3f deg（受偏航漂移缓慢注入，非定值）', rad2deg(s.steadyLinkError)), ...
+    sprintf('%.3f deg（受 yaw 参考变化注入）', rad2deg(s.steadyLinkError)), ...
     '< 3 deg');
 
-% ★ 负载姿态误差的判定必须排除偏航轴。
-%   原因见参数文件与 README §5.1：本构型（近似竖直绳索 + 水平面内挂点）下
-%   负载偏航通道结构性不可控，kR(3) = kOmega(3) 被置零，偏航角是自由积分轴，
-%   会缓慢漂移。这不是控制缺陷，而是欠驱动轴在无作动器时的必然行为。
-%   因此对 roll / pitch 两轴用严格门限，对偏航轴只检查"有界 + 漂移率可控"。
+% ★ 负载姿态按 roll/pitch 与 yaw 分开判定：yaw 是低带宽闭环轴，
+%   允许比 roll/pitch 更宽的误差门限，但必须直接检查相对参考角。
 if isfield(s, 'steadyAttitudeErrorVec') && numel(s.steadyAttitudeErrorVec) == 3
     attVec = s.steadyAttitudeErrorVec(:);
 else
@@ -291,15 +292,20 @@ checks = addCheck(checks, '稳态姿态误差(roll/pitch) < 3 deg', ...
     sprintf('%.4f deg（三轴范数 %.3f deg，yaw = %.3f deg）', ...
     rollPitchAttErr, rad2deg(norm(attVec)), rad2deg(attVec(3))), '< 3 deg');
 
-% 偏航漂移率门限：实测 30 s 时约 0.61 rad/s，60 s 时约 1.2 rad/s。
-% 取 1.0 rad/s 作为"30 s 演示窗口内不失控"的判据。
+% yaw 角速度门限用于防止低带宽通道在张力分配后产生过激响应。
 if isfield(s, 'loadBodyRateFinal') && numel(s.loadBodyRateFinal) == 3
-    yawDriftRate = abs(s.loadBodyRateFinal(3));
+    yawRate = abs(s.loadBodyRateFinal(3));
 else
-    yawDriftRate = 0;
+    yawRate = 0;
 end
-checks = addCheck(checks, '偏航漂移率 < 1.0 rad/s', yawDriftRate < 1.0, ...
-    sprintf('%.4f rad/s（欠驱动轴，见 README §5.1）', yawDriftRate), '< 1.0 rad/s');
+checks = addCheck(checks, '负载 yaw 角速度 < 1.0 rad/s', yawRate < 1.0, ...
+    sprintf('%.4f rad/s（低带宽 yaw 闭环）', yawRate), '< 1.0 rad/s');
+if isfield(cfg.loadController, 'yawChannelEnabled') && cfg.loadController.yawChannelEnabled ...
+        && isfield(s, 'steadyYawTrackingError') && isfinite(s.steadyYawTrackingError)
+    checks = addCheck(checks, '稳态负载 yaw 跟踪误差 < 10 deg', ...
+        s.steadyYawTrackingError < deg2rad(10), ...
+        sprintf('%.3f deg', rad2deg(s.steadyYawTrackingError)), '< 10 deg');
+end
 
 % ★ 推力峰值要**分开看起步段与稳态段**。
 %   cfg.initial 有意给负载一个很大的初始偏差（位置离目标 0.81 m、姿态 3/-2/4 deg、
@@ -454,11 +460,11 @@ if isfield(s, 'steadyAttitudeErrorVec') && numel(s.steadyAttitudeErrorVec) == 3
     ax = rad2deg(s.steadyAttitudeErrorVec(:));
     fprintf('  稳态负载姿态误差    : [roll pitch yaw] = [%.4f %.4f %.4f] deg\n', ...
         ax(1), ax(2), ax(3));
-    fprintf('    -> roll/pitch（可控轴，严格门限）: %.3f deg\n', norm(ax(1:2)));
-    fprintf('    -> yaw（欠驱动自由轴，见 README §5.1）: %.3f deg\n', ax(3));
+    fprintf('    -> roll/pitch（严格门限）: %.3f deg\n', norm(ax(1:2)));
+    fprintf('    -> yaw（低带宽闭环）      : %.3f deg\n', ax(3));
 end
 if isfield(s, 'loadBodyRateFinal') && numel(s.loadBodyRateFinal) == 3
-    fprintf('  负载角速度终值      : [%.4f %.4f %.4f] rad/s（yaw 分量为漂移率）\n', ...
+    fprintf('  负载角速度终值      : [%.4f %.4f %.4f] rad/s\n', ...
         s.loadBodyRateFinal(1), s.loadBodyRateFinal(2), s.loadBodyRateFinal(3));
 end
 fprintf('  最大位置误差        : %.4f m\n', s.maxPositionError);

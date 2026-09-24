@@ -72,15 +72,10 @@ Fd = m0 * (-cfg.loadController.kx .* ex ...
     - cfg.loadController.ki .* memory.positionIntegral ...
     + desired.acceleration(:) - g * e3);
 
-% 论文 (21)：负载姿态误差与角速度误差，以及期望合力矩 Md
-% ★★★ 关于偏航（第 3）通道：cfg.loadController.kR(3) 与 kOmega(3) 被置零。
-%   经系统辨识确认：只要这两个增益之一非零，闭环就发散（详见参数文件
-%   中"偏航通道必须关闭"的完整机理说明与实测数据）。物理原因是
-%   "近似竖直绳索 + 水平面内挂点"构型下，偏航力矩需求会变成张力的纯水平
-%   分量，而该分量既无法被 (27) 的投影交付为力矩（实测交付率 24.9% -> 0%），
-%   又会把期望绳向 q_id 甩向水平，形成纯正反馈。
-%   因此这里 kR .* eR0 与 kOmega .* eOmega0 的第 3 个分量自动为 0，
-%   Md 的偏航分量也随之为 0 —— 无需额外分支，但务必保留本注释以免后人误改。
+% 论文 (21)：负载姿态误差与角速度误差，以及期望合力矩 Md。
+% yaw 采用低带宽 SO(3) 闭环：kR(3)、kOmega(3) 保持非零，但明显低于
+% roll/pitch 通道。这样期望 yaw 力矩仍进入张力分配，同时减少水平张力
+% 对绳摆的激励；`yawChannelEnabled` 可用于显式关闭该通道的实验对比。
 R0d = desired.rotation;
 Omega0d = desired.bodyRate(:);
 Omega0dDot = desired.bodyRateDot(:);
@@ -90,6 +85,11 @@ feedforwardRate = R0.' * R0d * Omega0d;
 Md = -cfg.loadController.kR .* eR0 - cfg.loadController.kOmega .* eOmega0 ...
     + hat(feedforwardRate) * J0 * feedforwardRate ...
     + J0 * R0.' * R0d * Omega0dDot;
+if isfield(cfg.loadController, 'yawChannelEnabled') ...
+        && ~cfg.loadController.yawChannelEnabled
+    % 实验性关闭 yaw 时同时去掉反馈和前馈的 z 力矩，避免开关只改变标志位。
+    Md(3) = 0;
+end
 
 % 期望负载角加速度 Omega0_dot_cmd：由 (21) 的力矩反解
 %   J0 Omega0_dot = Md - Omega0 x J0 Omega0 + (耦合项)
@@ -125,7 +125,16 @@ end
 rhs6 = [R0.' * Fd; Md];
 % PPt \ rhs6 等价于 inv(PPt)*rhs6，但数值上更稳。
 % diag[R0,...,R0] 用 kron(eye(n), R0) 构造。
-muDesiredAll = reshape(kron(eye(n), R0) * (P.' * (PPt \ rhs6)), 3, n);
+muBody = P.' * (PPt \ rhs6);
+internalBiasBody = zeros(3 * n, 1);
+if isfield(cfg.link, 'allowTiltedCables') && cfg.link.allowTiltedCables ...
+        && isfield(cfg.allocation, 'outwardBiasFraction')
+    internalBiasBody = outwardInternalBias(P, rhoAll, m0, g, ...
+        cfg.allocation.outwardBiasFraction, cfg.allocation.outwardBiasMax);
+    % P*internalBiasBody = 0，因此不改变负载合力和合力矩。
+    muBody = muBody + internalBiasBody;
+end
+muDesiredAll = reshape(kron(eye(n), R0) * muBody, 3, n);
 
 % ======================================================================
 % (3)(4) 逐机：平行分量 (17) 与绳向环 (27)
@@ -251,24 +260,7 @@ eRAll = zeros(3, n);
 eOmRAll = zeros(3, n);
 omegaCmdAll = zeros(3, n);
 
-% (37) 期望姿态 R_ic 的"第一轴参考方向" b1d。
-%   'reference' —— 论文原式：取负载期望姿态 R0d 的第一轴（负载 yaw 转到哪，机体跟着转）
-%   'worldX'    —— 机体航向**锁定世界 +x**，不跟负载参考 yaw
-%
-% ★ 实测（八字工况，52 s，Python 镜像）：
-%     机体航向跟参考转 ：负载偏航率标准差（抖幅）= 0.0505 rad/s
-%     机体航向锁定 +x  ：负载偏航率标准差（抖幅）= 0.0270 rad/s   ← 抖幅减半
-%   其余指标（跟踪误差 705.09 mm、推力峰值 69.1%、|Omega0| 峰值 1.465）**完全一致**。
-%   机理：机体航向跟着转 ⇒ 挂点方位随负载参考 yaw 转动 ⇒ 把绳索"拧"起来，
-%   反过来激励负载偏航（而负载偏航不可控、无法耗散）⇒ 抖动被放大。
-%   锁定机体航向断开这条激励通路，代价是机体航向不再指向负载参考第一轴
-%   —— 对四旋翼而言 yaw 与推力解耦，这个代价是**零**。
-if isfield(cfg.attitudeController, 'headingSource') ...
-        && strcmpi(cfg.attitudeController.headingSource, 'worldX')
-    b1d = [1; 0; 0];
-else
-    b1d = desired.rotation(:, 1);
-end
+b1d = desired.rotation(:, 1);
 
 for i = 1:n
     Ri = Rall(:, :, i);
@@ -344,6 +336,7 @@ command.desiredMoment = Md;
 command.desiredLinkUnits = desiredLinkAll;
 command.linkDirectionErrors = eqAll;
 command.desiredTensions = muDesiredAll;      % 分配结果 mu_id（3 x n）
+command.internalTensionBias = reshape(kron(eye(n), R0) * internalBiasBody, 3, n);
 command.tensions = zeros(1, n);              % 实际张力 = ||mu_i||，mu_i = q_i q_i' mu_id
 for i = 1:n
     qi = normalizeVector(Qall(:, i));
@@ -406,4 +399,32 @@ end
 
 function value = clampVector(value, lowerBound, upperBound)
 value = min(max(value, lowerBound), upperBound);
+end
+
+function bias = outwardInternalBias(P, rhoAll, mass, gravity, fraction, maxRms)
+%OUTWARDINTERNALBIAS 生成不改变负载 wrench 的外张内部张力。
+n = size(rhoAll, 2);
+desired = zeros(3, n);
+for i = 1:n
+    radial = [rhoAll(1, i); rhoAll(2, i); 0];
+    if norm(radial) < 1e-12
+        angle = 2 * pi * (i - 1) / max(n, 1);
+        radial = [cos(angle); sin(angle); 0];
+    else
+        radial = radial / norm(radial);
+    end
+    desired(:, i) = fraction * mass * gravity / sqrt(n) * radial;
+end
+nullBasis = null(P);
+if isempty(nullBasis)
+    bias = zeros(3 * n, 1);
+    return
+end
+bias = nullBasis * (nullBasis.' * desired(:));
+biasBlocks = reshape(bias, 3, n);
+biasRms = sqrt(mean(sum(biasBlocks.^2, 1)));
+targetRms = min(fraction * mass * gravity / sqrt(n), maxRms);
+if biasRms > 1e-12 && targetRms > 0
+    bias = bias * (targetRms / biasRms);
+end
 end
