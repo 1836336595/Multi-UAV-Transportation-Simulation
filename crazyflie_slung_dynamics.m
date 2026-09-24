@@ -116,14 +116,17 @@ for i = 1:n
     rhs1 = rhs1 + zeta_i;
 
     % (6) 中第 i 机的贡献
-    rhs2 = rhs2 + rhoHat.' * R0.' * zeta_i;
+    % 论文 (6) 的力矩臂项为 hat(rho_i) R0' zeta_i。
+    % 这里不能写成 rhoHat.'：那会把分配矩阵 P 中的期望力矩反号，
+    % 尤其在 yaw 通道开启时形成正反馈。
+    rhs2 = rhs2 + rhoHat * R0.' * zeta_i;
 
     % 各耦合矩阵块
     sumQ = sumQ + m * Qi;
     sumMRho = sumMRho + m * Qi * R0 * rhoHat;
     R0tQi = R0.' * Qi;
-    sumRhoQ = sumRhoQ + m * rhoHat.' * R0tQi;
-    sumRhoQRho = sumRhoQRho + m * rhoHat.' * R0tQi * R0 * rhoHat;
+    sumRhoQ = sumRhoQ + m * rhoHat * R0tQi;
+    sumRhoQRho = sumRhoQRho + m * rhoHat * R0tQi * R0 * rhoHat;
 end
 
 % 论文 (5)：Mq = m0 I + sum_i m_i q_i q_i'

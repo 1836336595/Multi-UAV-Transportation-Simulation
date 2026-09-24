@@ -1,167 +1,163 @@
-# 三机协同吊运 —— 让载荷到达指定位置（期望偏航锁定）
+# Geometric Control of Cable-Suspended Rigid Body
 
-> 三机协同吊运（Crazyflie 2.1 Brushless）仿真 · **版本 A**
-> 基于 Lee 2014 (arXiv:1403.3684) / Lee 2018 (IEEE TCST) 的几何控制框架
-> MATLAB R2021b · 纯 MATLAB 实现，无附加工具箱依赖
+三架 Crazyflie 2.1 Brushless 协同吊运刚体负载的 MATLAB 仿真工程，基于 Lee 2014/2018 的几何控制框架。本分支使用八字轨迹、负载 yaw 参考和倾斜缆绳构型。
 
----
+本版本重点处理：
 
-## 1. 这是什么
+1. 负载尺寸、挂点、惯量和相关控制参数保持一致；
+2. 负载 yaw 使用低带宽闭环，不再关闭 yaw 反馈；
+3. 缆绳允许倾斜，无人机不被强制放在负载正上方；
+4. 小尺寸负载通过张力分配零空间的外张内部力降低无人机碰撞风险。
 
-完整的三阶段任务：**起飞 → 绕两个八字环绕两个锥形障碍 → 降落归位**。
-负载最终停在指定落点 `[0, 0, -0.35] m`（z 轴向下为正）。
+## 运行环境
 
-**本版本的期望偏航锁定为 0**，即 `R0d` 的第一轴恒为世界 `+x`。
-这是"最近一个全部判据通过的可用版本"，建议作为回退基线。
+- MATLAB R2021b 或更新版本
+- 不依赖附加工具箱
+- 建议运行前切换到本目录，不要把多个同名版本同时加入 MATLAB 路径。
 
-**与另外两个版本的关系**：见 [../README.md](../README.md)。
-
----
-
-## 2. 怎么运行
+## 快速运行
 
 ```matlab
->> cd('<本目录>')
->> crazyflie_slung_demo          % 一键跑完并打印全部自检
+cd('F:/workbuddy_doc/transporting/git')
+report = crazyflie_slung_demo('quick');  % 快速自检，不绘图
+report = crazyflie_slung_demo();         % 完整仿真、自检和可视化
 ```
 
-> ⚠ **文件名与其它版本完全相同，请单独 `cd` 到本目录再运行。**
-> 若把多个版本目录同时加进 MATLAB 搜索路径，同名 `.m` 会互相遮蔽，
-> 你跑的可能不是你以为的那一份。
-
-### 主要文件
+## 文件说明
 
 | 文件 | 作用 |
 |---|---|
-| `crazyflie_slung_demo.m` | 入口：跑仿真 + 打印配置与全部自检结论 |
-| `crazyflie_slung_parameters.m` | **所有可调参数**（本版本与其它版本的差别只在这个文件） |
-| `crazyflie_slung_reference.m` | 参考轨迹（起飞 → 环绕 → 降落） |
-| `crazyflie_slung_controller.m` | 几何控制器 (20)(21)(27)(36)-(40) |
-| `crazyflie_slung_dynamics.m` | 刚体+绳索动力学 (5)-(8) |
-| `crazyflie_slung_simulation.m` | 主循环：执行器/速率环建模、积分、记录 |
-| `crazyflie_slung_visualization.m` | 三维动画与结果图 |
-| `crazyflie_slung_diagnose.m` | 独立的发散定位脚本（不画图，只报告） |
+| `crazyflie_slung_parameters.m` | 默认参数、负载尺寸派生量和合法性检查 |
+| `crazyflie_slung_controller.m` | 负载位置/yaw 外环、张力分配、绳向控制和机体指令 |
+| `crazyflie_slung_dynamics.m` | 负载、绳索和无人机动力学 |
+| `crazyflie_slung_simulation.m` | 执行器模型、积分、日志和碰撞诊断 |
+| `crazyflie_slung_reference.m` | 静态目标或八字轨迹参考 |
+| `crazyflie_slung_demo.m` | 一键仿真和自检报告 |
+| `crazyflie_slung_visualization.m` | 轨迹和三维构型可视化 |
+| `crazyflie_slung_diagnose.m` | 数值异常和发散起点定位 |
+| `ENGINEERING_LOG.md` | 公式、修改原因和调参记录 |
 
----
+## 修改负载尺寸
 
-## 3. 本版本的配置
-
-```text
-八字避障 —— 起飞 3 s + 环绕 45 s + 降落 4 s（共 52 s）
-referenceFcn   : @(t) crazyflie_slung_reference(t, cfg)     ← 八字轨迹
-figureEight.lockYaw        : true      ← 期望偏航恒为 0
-figureEight.amplitudeX/Y   : 1.50 / 1.62 m（对齐论文 Fig.2 的 1.85 宽高比）
-figureEight.blendTime      : 5.0 s     ← 必须 >= 5，见 ENGINEERING_LOG §10
-simulation.duration        : 52.0 s
-loadController.kx/kv/ki    : [14,14,17.5] / 8.68 / 3.0
-attitudeController.kR      : [240;240;120]   ← 新挂点几何必需，×1 会发散
-payload.rotationalDamping  : 1e-3 N·m·s/rad  ← 物理转动阻尼，见 §5
-payload.attachPoints       : 一边中点 + 对边两顶点（悬停张力 2:1:1）
-obstacles.enabled          : true（两个锥在八字两叶的叶心）
-```
-
-### 相对 `v3/` 当前版的差别
-
-| 参数 | **本档 A** | B 档 | C 档 | `v3/` 当前 |
-|---|---|---|---|---|
-| `referenceFcn` | 八字轨迹函数 | 八字轨迹函数 | `[]`（定高） | 八字轨迹函数 |
-| `simulation.duration` | 52.0 s | 52.0 s | 30.0 s | 52.0 s |
-| `loadController.kx` | `[14;14;17.5]` | 同 | `[3;3;3.75]` | 同 |
-| `lockYaw` | **`true`** ← 本档特征 | `false` | `false` | `false` |
-| `obstacles.enabled` | `true` | `true` | `false` | `true` |
-
-其余文件与 `v3/` 当前版**逐字节相同**。
-
----
-
-## 4. 已验证结果
-
-源于**逐行对应的 Python 数值镜像**（`_verify_python/_multi_mirror.py`）。
-本环境无法调用 MATLAB，因此 MATLAB 侧只做静态检查，数值结论全部来自镜像。
-
-```text
-起飞段 [0, 3.0 s]        : 峰值      18.5 mm
-环绕段 [3.0, 48.0 s]     : 峰值     705.1 mm / 均值 43.3 mm
-降落段 [48.0, 52.0 s]    : 峰值     183.9 mm
-降落终点残差             :      90.0 mm      ← 目标 [0, 0, -0.35]，载荷正确到达
-到锥最小净间隙           :     125.3 mm  PASS（判据 > 50 mm）
-稳态各绳索张力           : [0.3928, 0.1962, 0.1962] N（= 挂点几何解出的 2:1:1）
-绳索长度不变量           : 2.22e-16 m  PASS
-最小张力裕度             : 33.0 %     （绳索全程绷紧，单边约束 mu_i > 0 未被激活）
-推力峰值占比             : 69.1 %     （< 95%，未饱和）
-最大机体角速度           : 3.949 rad/s（< 8 rad/s）
-负载偏航漂移率           : 0.001 rad/s（< 1.0）
-状态有限 / 各机在负载上方 : True / True
-坏步计数（代数系统非有限）: 0
-```
-
----
-
-## 5. 关键机制（读这个才能改对参数）
-
-### 5.1 挂点几何决定静载分布（不是可选参数）
-
-用户指定的挂点 = **某边中点 + 对边两个顶点**。挂点质心因此偏离负载质心
-`a/3 = 0.0333 m`，悬停时三根绳必须给出**不等张力**才能平衡力矩：
-
-```text
-T = [0.3924, 0.1962, 0.1962] N   （旧的内接等边三角形是三等分 0.2616 N）
-推力占比 [53.3%, 38.6%, 38.6%]   （旧值 43.5% ×3）
-```
-
-⇒ 机 1 的推力需求提高、最小张力降低，**必须靠自检确认全程无松弛**。
-实测最小张力裕度 33.0%，全程绷紧。
-
-### 5.2 为什么 `attitudeController.kR` 要 ×8
-
-新挂点带来 2:1:1 的**不对称静载** ⇒ 各机受到的绳索反作用不再对称 ⇒
-机体姿态必须更"硬"，否则推力方向偏离并与绳摆环正反馈。
-实测：`kR` ×1 时静态悬停 1.202 s 发散、八字 1.646 s 发散；
-悬崖在 ×3~×5 之间，**×5~×20 是性能几乎不变的平台区**，取 ×8 居中。
-
-### 5.3 为什么需要 `payload.rotationalDamping`
-
-上述质心偏移还产生一个**"负载偏航 ↔ 绳索扭转"耦合模态**（约 2.2 rad/s）。
-而负载偏航通道是**结构性不可控**的（`kR(3)=kOmega(3)=0`），
-且**任何偏航反馈都会经 `Md → 张力分配 → q_id 水平化` 形成正反馈**
-（实测：`kOmega(3)=0.005` 就能发散到 1e8）。
-
-⇒ 该模态既无阻尼也无控制，闭环恰好骑在稳定边界上。
-
-**解决**：把**真实存在的转动阻尼**补进模型，作为**外部力矩**直接加在负载转动方程右端，
-**不经控制器、不进张力分配**，因此不会触发上述正反馈：
+`payload.size = [a; b; c]` 表示负载长、宽、高，单位为米。只修改尺寸时，程序会自动重建挂点、惯量、阻尼、负载姿态增益、悬停张力和初始推力：
 
 ```matlab
-rhsBlock = [rhs1; rhs2 - cross(Omega0, J0*Omega0) - rotationalDamping*Omega0];
+userCfg.payload.size = [0.12; 0.10; 0.06];  % [长; 宽; 高]
+cfg = crazyflie_slung_parameters(userCfg);
+sim = crazyflie_slung_simulation(cfg);
 ```
 
-取值依据是物理量级估算（边长 0.2 m 方板绕法向旋转的气动阻尼力矩
-`(1/8)rho Cd a^4 omega^2 ≈ 2.4e-3 N·m` ⇒ 等效线性系数 ≈ 8e-4），取 **1.0e-3**。
-效果：偏航漂移率 **0.862 → 0.001 rad/s**，位置跟踪完全不变。
+默认挂点模板为：
 
-### 5.4 为什么 `blendTime >= 5 s`
+\[
+\rho_1=(a/2,0,-c/2),\quad
+\rho_2=(-a/2,b/2,-c/2),\quad
+\rho_3=(-a/2,-b/2,-c/2).
+\]
 
-环绕段两端的速度包络 `env = sigma(t/B)·sigma((T2-t)/B)`。
-其加速度项含 `env'' ~ 1/B²`，峰值与 `s²·a_hat` 峰值**同相叠加**，
-理论 2.92 m/s² 会被放大到 **9.20 m/s²（3.15 倍）**。
-实测 B = 1.2 s 时 3.76 s 就发散。放大倍数 ∝ 1/B² ⇒ B 必须 >= 5 s。
+代码通过无量纲 `payload.attachFractions` 乘以 `payload.size` 生成实际挂点，因此尺寸变化后挂点仍位于负载上表面边界。显式提供 `userCfg.payload.attachPoints` 时，用户挂点优先，但必须为 `3 x n` 且列数等于无人机数量。
 
-### 5.5 `USE_QID_DOT = false`（在 controller.m 里）
+均质长方体惯量自动计算为：
 
-论文 (27) 的 `−(q_i·omega_id)·q_id_dot` 项。`q_id` 是单位向量，
-除以 0.002 s 差分信噪比极差 ⇒ 正反馈。
-关掉后稳定域从 `aX ≈ 0.15 m` 扩到 **0.80 m 以上（5 倍）**。
-静态工况看不出差别（该项理想值本就是 0），**只有八字轨迹才暴露**。
+\[
+J_0=\operatorname{diag}\left(
+\frac{m_0(b^2+c^2)}{12},
+\frac{m_0(a^2+c^2)}{12},
+\frac{m_0(a^2+b^2)}{12}
+\right).
+\]
 
----
+同时更新 `payload.inertia`、`volume`、`surfaceArea`、`boundingRadius`、`rotationalDamping`、`loadController.kR` 和 `loadController.kOmega`。默认质量独立于尺寸；若要模拟同密度物品，省略 `mass` 并提供：
 
-## 6. 完整工程记录
+```matlab
+userCfg.payload.size = [0.12; 0.10; 0.06];
+userCfg.payload.density = 650;  % kg/m^3
+cfg = crazyflie_slung_parameters(userCfg);
+```
 
-本目录的 `ENGINEERING_LOG.md` 是开发全程的工程记录（约 160 KB），内容包括：
+显式提供 `mass`、`inertia` 或 `rotationalDamping` 时，对应用户值优先。
 
-- 论文公式逐条对照与实现说明
-- 每一个参数的**来历与扫描数据**（为什么是这个值）
-- 每一类**缺陷的复现与修复过程**（含踩过的坑与教训）
-- 完整的自检清单与判据依据
+## 负载 yaw 控制
 
-**改编参数前请先读它。**
+负载 yaw 反馈默认开启：
+
+```matlab
+cfg.loadController.yawChannelEnabled = true;
+```
+
+八字轨迹默认 `figureEight.lockYaw = false`，因此期望 yaw 沿路径切线变化；设为 `true` 只会把参考 yaw 锁到 0，不会自动关闭反馈环。
+
+控制器先计算负载 SO(3) 姿态误差和期望力矩 `Md`，再通过
+
+\[
+P=\begin{bmatrix}I&I&I\\\widehat\rho_1&\widehat\rho_2&\widehat\rho_3\end{bmatrix}
+\]
+
+把合力和合力矩分配到各根缆绳。yaw 力矩由缆绳的水平张力分量传递；默认目标带宽为 `0.80 Hz`，低带宽只表示避免激励摆动，不表示关闭 yaw。`yawChannelEnabled=false` 时才会在控制器中清零 yaw 力矩。
+
+仿真输出包括 `loadYawLog`、`loadYawRefLog`、`loadYawErrorLog`、`steadyYawTrackingError` 和 `finalYawTrackingError`。无人机自身的 `headingSource` 只影响无人机绕推力轴的航向，不会关闭负载 yaw 环。
+
+## 倾斜缆绳和碰撞避免
+
+默认开启：
+
+```matlab
+cfg.link.allowTiltedCables = true;
+```
+
+控制器在最小范数张力解上加入内部力，并满足：
+
+\[
+P\mu_{\mathrm{internal}}=0.
+\]
+
+因此内部力不改变负载期望合力和合力矩，只改变各根缆绳的空间分布，使无人机从挂点正上方适度向外侧分开：
+
+```matlab
+cfg.allocation.outwardBiasFraction = 0.20;
+cfg.allocation.outwardBiasMax = 0.12;
+cfg.link.initialOutwardOffset = NaN;  % 自动设置
+cfg.link.vehicleClearance = 0.02;
+```
+
+缆绳约束仍为：
+
+\[
+x_i=x_0+R_0\rho_i-l_iq_i,\qquad \|q_i\|=1.
+\]
+
+自检不再要求 `q_i=e_3` 或无人机位于负载正上方，而是检查绳长、张力正性、无人机间距、无人机与负载外接包络间隙和垂直净空诊断。
+
+## 重要参数
+
+| 参数 | 含义 |
+|---|---|
+| `payload.size` | 负载 `[长; 宽; 高]` |
+| `payload.mass` / `payload.density` | 质量，或由密度和体积自动计算 |
+| `payload.attachFractions` | 自动挂点模板 |
+| `payload.attachPoints` | 负载坐标系中的实际挂点 `rho_i` |
+| `payload.inertia` | 负载质心惯量矩阵 |
+| `loadController.yawChannelEnabled` | 负载 yaw 反馈开关，默认 `true` |
+| `link.allowTiltedCables` | 是否允许倾斜缆绳 |
+| `allocation.outwardBiasFraction` | 外张内部力比例 |
+| `allocation.outwardBiasMax` | 外张内部力上限 |
+| `vehicle.collisionRadius` | 无人机碰撞包络半径 |
+| `link.vehicleClearance` | 碰撞安全间隙 |
+
+## 坐标和符号约定
+
+- `q_i` 是从无人机指向负载的单位向量。
+- `R_0` 和 `R_i` 是机体系到惯性系的旋转矩阵。
+- `e_3=[0;0;1]` 指向重力方向，z 轴向下为正。
+- 四旋翼实际作用力为 `-f_i R_i e_3`。
+- 绳索只能受拉；张力非正表示绷紧缆绳模型不再适用。
+
+## 修改后检查
+
+1. 修改 `crazyflie_slung_parameters.m` 或通过 `userCfg` 覆盖参数。
+2. 运行 `crazyflie_slung_demo('quick')`。
+3. 检查 yaw 误差、最小张力、无人机间距和机体-负载间隙。
+4. 再运行完整仿真并查看日志和图形。
+5. 提交前运行 `git diff --check`。
+
+本工程只包含本地代码和文档，不包含自动上传 GitHub 的脚本。

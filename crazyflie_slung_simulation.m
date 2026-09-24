@@ -99,10 +99,10 @@ sim.positionErrorLog = zeros(1, nSteps);
 sim.positionErrorVectorLog = zeros(3, nSteps);
 sim.omegaCommandLog = zeros(3, n, nSteps);
 sim.desiredTensionLog = zeros(3, n, nSteps);
-% 负载姿态误差的按轴日志（3 x nSteps）：用于区分可控轴（roll/pitch）
-% 与欠驱动轴（yaw，见 README §5.1）。负载只有一个，故不重复 n 份。
+% 负载姿态误差的按轴日志（3 x nSteps）：用于分别检查 roll/pitch/yaw。
+% 负载只有一个，故不重复 n 份。
 sim.loadAttitudeErrorLog = zeros(3, nSteps);
-% 负载角速度日志（3 x nSteps）：用于检查偏航漂移率。
+% 负载角速度日志（3 x nSteps）：用于检查低带宽 yaw 闭环的角速度。
 sim.loadBodyRateLog = zeros(3, nSteps);
 % ★★★ 期望负载 yaw 日志（1 x nSteps, rad）= 参考姿态 R0d 第一轴方位角。
 %   ★ 必须在此记录，不要在可视化里事后重调 cfg.referenceFcn：匿名句柄的**多输出**
@@ -111,6 +111,8 @@ sim.loadBodyRateLog = zeros(3, nSteps);
 %   ★ 若本工况期望 yaw 恒为 0（如 lockYaw=true 或定高），该日志会**全为 0**，
 %     这是正常数据；画图时不能用 any(日志 ~= 0) 判有效。
 sim.loadYawRefLog = zeros(1, nSteps);
+sim.loadYawLog = zeros(1, nSteps);
+sim.loadYawErrorLog = zeros(1, nSteps);
 
 previousLoadAcceleration = zeros(3, 1);
 previousLoadBodyAcceleration = zeros(3, 1);
@@ -139,6 +141,10 @@ for k = 1:nSteps
     end
     sim.loadBodyRateLog(:, k) = state.loadBodyRate;
     sim.loadYawRefLog(k) = atan2(desired.rotation(2, 1), desired.rotation(1, 1));
+    actualYaw = atan2(state.loadRotation(2, 1), state.loadRotation(1, 1));
+    referenceYaw = sim.loadYawRefLog(k);
+    sim.loadYawLog(k) = actualYaw;
+    sim.loadYawErrorLog(k) = wrapAngle(actualYaw - referenceYaw);
     sim.positionErrorLog(k) = norm(command.positionError);
     sim.positionErrorVectorLog(:, k) = command.positionError;
     sim.omegaCommandLog(:, :, k) = command.omegaCommands;
@@ -562,6 +568,9 @@ steadyIndex = max(1, round(0.8 * nSteps)):nSteps;
 loadPosition = sim.loadPositionLog;
 loadHeight = -loadPosition(3, :);
 vehicleHeight = -squeeze(sim.vehiclePositionLog(3, :, :));   % n x nSteps
+if isvector(vehicleHeight)
+    vehicleHeight = reshape(vehicleHeight, n, nSteps);
+end
 
 summary.loadPositionFinal = loadPosition(:, end);
 summary.loadHeightFinal = loadHeight(end);
@@ -572,8 +581,8 @@ summary.steadyLinkError = mean(max(sim.linkErrorLog(:, steadyIndex), [], 1));
 summary.maxLinkError = max(sim.linkErrorLog(:));
 summary.steadyAttitudeError = mean(max(sim.attitudeErrorLog(:, steadyIndex), [], 1));
 summary.maxAttitudeError = max(sim.attitudeErrorLog(:));
-% ★ 姿态误差的按轴分解（稳态均值），供自检脚本区分"roll/pitch 可控轴"
-%   与"偏航欠驱动轴"。loadAttitudeErrorLog 记录的是每步的三轴姿态误差向量，
+% ★ 姿态误差的按轴分解（稳态均值），供自检脚本分别检查 roll/pitch/yaw。
+%   loadAttitudeErrorLog 记录的是每步的三轴姿态误差向量，
 %   取稳态窗口的时间均值得到逐轴残差。
 %   注意：该日志里各架机的负载姿态误差是同一个量（负载只有一个），
 %   因此直接抽出第 1 架即可。
@@ -583,11 +592,25 @@ else
     % 退路：没有按轴日志时用范数标量填充，保证字段存在且维度为 3x1
     summary.steadyAttitudeErrorVec = repmat(summary.steadyAttitudeError, 3, 1);
 end
-% 负载终态角速度（用于检查偏航漂移率；yaw 分量为欠驱动自由轴）
+% 负载终态角速度（用于检查低带宽 yaw 闭环）
 if isfield(sim, 'loadBodyRateLog') && ~isempty(sim.loadBodyRateLog)
     summary.loadBodyRateFinal = sim.loadBodyRateLog(:, end);
 else
     summary.loadBodyRateFinal = zeros(3, 1);
+end
+if isfield(sim, 'loadYawErrorLog')
+    yawError = sim.loadYawErrorLog(:).';
+    summary.steadyYawTrackingError = mean(abs(yawError(steadyIndex)));
+    summary.maxYawTrackingError = max(abs(yawError));
+    summary.finalYawTrackingError = abs(yawError(end));
+    summary.loadYawFinal = sim.loadYawLog(end);
+    summary.loadYawReferenceFinal = sim.loadYawRefLog(end);
+else
+    summary.steadyYawTrackingError = NaN;
+    summary.maxYawTrackingError = NaN;
+    summary.finalYawTrackingError = NaN;
+    summary.loadYawFinal = NaN;
+    summary.loadYawReferenceFinal = NaN;
 end
 summary.maxBodyRate = max(abs(sim.bodyRateLog(:)));
 summary.maxThrustPercentage = max(sim.thrustPctLog(:));
@@ -617,8 +640,33 @@ end
 summary.maxRopeLengthDrift = maxRopeLengthDrift;
 summary.ropeLengthInvariantHolds = maxRopeLengthDrift < 1e-9;
 
-% 每架四旋翼都必须始终高于负载
-summary.allVehiclesAboveLoad = all(all(vehicleHeight > loadHeight + 0.05, 2));
+% 倾斜缆绳下不要求无人机位于负载正上方；保留垂直净空作为诊断。
+verticalClearance = vehicleHeight - repmat(loadHeight, n, 1);
+summary.minVehicleVerticalClearance = min(verticalClearance(:));
+summary.allVehiclesAboveLoad = summary.minVehicleVerticalClearance > 0;
+summary.minLinkVerticalComponent = min(sim.linkUnitLog(3, :, :), [], 'all');
+
+% 无人机间距和无人机-负载外接包络间隙，用于倾斜缆绳下的碰撞诊断。
+minVehicleSeparation = inf;
+minVehiclePayloadClearance = inf;
+for k = 1:nSteps
+    for i = 1:n
+        for j = i + 1:n
+            minVehicleSeparation = min(minVehicleSeparation, ...
+                norm(sim.vehiclePositionLog(:, i, k) - sim.vehiclePositionLog(:, j, k)));
+        end
+        centerDistance = norm(sim.vehiclePositionLog(:, i, k) - loadPosition(:, k));
+        minVehiclePayloadClearance = min(minVehiclePayloadClearance, ...
+            centerDistance - cfg.payload.boundingRadius - cfg.vehicle.collisionRadius);
+    end
+end
+summary.minVehicleSeparation = minVehicleSeparation;
+summary.requiredVehicleSeparation = 2 * cfg.vehicle.collisionRadius + cfg.link.vehicleClearance;
+summary.vehicleCollisionFree = minVehicleSeparation > summary.requiredVehicleSeparation;
+summary.vehicleSeparationMargin = minVehicleSeparation - summary.requiredVehicleSeparation;
+summary.minVehiclePayloadClearance = minVehiclePayloadClearance;
+summary.vehiclePayloadCollisionFree = minVehiclePayloadClearance > cfg.link.vehicleClearance;
+summary.vehiclePayloadClearanceMargin = minVehiclePayloadClearance - cfg.link.vehicleClearance;
 summary.finiteState = all(isfinite(loadPosition(:))) ...
     && all(isfinite(sim.linkUnitLog(:))) && all(isfinite(sim.bodyRateLog(:)));
 % ★ 坏步计数：> 0 说明代数系统曾经出现非有限量（即使状态日志看起来正常）。
@@ -740,13 +788,23 @@ else
     summary.payloadBoundingRadius = 0.5 * norm(cfg.payload.size);
 end
 
-% 悬停时每根绳索张力 = m0 g / n（论文 (18)：sum mu_i = m0 g）
-summary.hoverTensionPerLink = cfg.payload.mass * cfg.vehicle.gravity / n;
-% 每机悬停推力 = m0 g / n + m_i g（论文 (17) 的悬停解）
-summary.hoverThrustPerVehicle = summary.hoverTensionPerLink ...
+% 悬停总张力仍满足 sum(mu_i) = m0 g，但不对称挂点下各根绳不一定等分。
+rhoHover = cfg.payload.attachPoints;
+hoverBalance = [ones(1, n); rhoHover(2, :); -rhoHover(1, :)];
+if size(hoverBalance, 1) == size(hoverBalance, 2) && rank(hoverBalance) == n
+    hoverTensionByLink = abs(hoverBalance \ ...
+        [-cfg.payload.mass * cfg.vehicle.gravity; 0; 0]);
+else
+    hoverTensionByLink = repmat(cfg.payload.mass * cfg.vehicle.gravity / n, n, 1);
+end
+summary.hoverTensionByLink = hoverTensionByLink;
+summary.hoverTensionPerLink = mean(hoverTensionByLink);
+% 垂直悬停参考：每机推力约为对应绳张力 + 机体自重。
+summary.hoverThrustByVehicle = hoverTensionByLink ...
     + cfg.vehicle.mass * cfg.vehicle.gravity;
-summary.hoverThrustTotal = n * summary.hoverThrustPerVehicle;
-summary.hoverThrustPercentage = 100 * summary.hoverThrustPerVehicle ...
+summary.hoverThrustPerVehicle = mean(summary.hoverThrustByVehicle);
+summary.hoverThrustTotal = sum(summary.hoverThrustByVehicle);
+summary.hoverThrustPercentage = 100 * max(summary.hoverThrustByVehicle) ...
     / cfg.vehicle.maxTotalThrust;
 summary.thrustToWeightRatio = n * cfg.vehicle.maxTotalThrust ...
     / ((cfg.payload.mass + n * cfg.vehicle.mass) * cfg.vehicle.gravity);
@@ -792,4 +850,8 @@ end
 
 function value = clampVector(value, lowerBound, upperBound)
 value = min(max(value, lowerBound), upperBound);
+end
+
+function value = wrapAngle(value)
+value = atan2(sin(value), cos(value));
 end

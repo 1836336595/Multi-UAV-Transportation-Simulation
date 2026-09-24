@@ -20,6 +20,16 @@ nSteps = numel(time);
 n = cfg.vehicle.count;
 steady = max(1, round(0.8 * nSteps)):nSteps;
 
+% 不对称挂点下悬停张力不一定等分，使用几何平衡解作为参考线。
+rhoAll = cfg.payload.attachPoints;
+balanceMatrix = [ones(1, n); rhoAll(2, :); -rhoAll(1, :)];
+if size(balanceMatrix, 1) == size(balanceMatrix, 2) && rank(balanceMatrix) == n
+    hoverTensionReference = abs(balanceMatrix \ ...
+        [-cfg.payload.mass * cfg.vehicle.gravity; 0; 0]);
+else
+    hoverTensionReference = repmat(cfg.payload.mass * cfg.vehicle.gravity / n, n, 1);
+end
+
 % 显示时把 z 取反（绘图纵轴向上为正）
 loadDisplay = sim.loadPositionLog;
 loadDisplay(3, :) = -loadDisplay(3, :);
@@ -118,9 +128,8 @@ title('各绳向误差 ‖q_{id} × q_i‖');
 legend(arrayfun(@(i) sprintf('绳索 %d', i), 1:n, 'UniformOutput', false), ...
     'Location', 'best');
 
-% 注意：该误差**没有真正的稳态值**。它会随负载偏航漂移缓慢单调增长
-% （实测斜率 +0.057 deg/s），自检里的 3 deg 门限对应 30 s 的仿真时长。
-% 详见 README §6.2。
+% 注意：该误差受低带宽 yaw 参考变化和绳向环带宽共同影响，
+% 自检里的 3 deg 门限用于判断演示窗口内是否保持有界。
 
 % ---- (4) 高度 ----
 subplot(2, 3, 4);
@@ -143,7 +152,7 @@ yyaxis left;
 plot(time, sim.tensionLog.', 'LineWidth', 1.2);
 hold on;
 plot([time(1), time(end)], ...
-    repmat(cfg.payload.mass * cfg.vehicle.gravity / n, 1, 2), ':', ...
+    repmat(hoverTensionReference.', 2, 1), ':', ...
     'Color', [0.6, 0.6, 0.6], 'LineWidth', 1.0);
 ylabel('绳索张力 (N)');
 yyaxis right;
@@ -156,13 +165,13 @@ title('绳索张力（左）与推力占比（右）');
 legend(hThrust, arrayfun(@(i) sprintf('机 %d 推力', i), 1:n, ...
     'UniformOutput', false), 'Location', 'best');
 
-% ---- (6) 负载偏航角（欠驱动自由轴）----
+% ---- (6) 负载偏航角（低带宽闭环）----
 % ★ 这一格原来画"机 1 角速度指令 vs 实测"，但它与自检输出的
 %   "最大机体角速度" 完全重复。负载偏航角才是本仿真最需要被看见的量：
-%   它单调漂移、导致绳向误差缓增、也是三维图里"圆环"的来源。
+%   它应跟踪参考 yaw；解卷绕后可直接观察跟踪误差和是否出现来回摆动。
 subplot(2, 3, 6);
 % ★ 同时画【参考 yaw】与【实际 yaw】。参考取仿真时记下的 sim.loadYawRefLog
-%   （= 参考姿态 R0d 的第一轴方位角；本工况 lockYaw=true ⇒ 恒为 0）。
+%   （= 参考姿态 R0d 的第一轴方位角；lockYaw=true 时才恒为 0）。
 %   ★★ 两条都必须 unwrap（解卷绕）：yaw 是角度，+179° 跳到 -179° 只是跨过
 %      ±180 割线、并非真的反向；不解卷绕就会被看成"正负乱跳"。
 %   ★★ 有效性判据只看**字段是否存在、长度是否对得上**；
@@ -191,7 +200,7 @@ if ~isempty(yawDesUnwrap)
         sqrt(mean((yawUnwrap - yawDesUnwrap).^2))));
     legend({'参考 yaw', '实际 yaw'}, 'Location', 'best');
 else
-    title('负载偏航角（欠驱动自由轴，见 README §5.1）');
+    title('负载偏航角（低带宽闭环）');
     legend({'实际 yaw'}, 'Location', 'best');
 end
 end
@@ -347,9 +356,7 @@ payloadPatch = patch(ax, 'Vertices', zeros(8, 3), 'Faces', boxFaces, ...
     'FaceColor', [0.55, 0.72, 0.92], 'FaceAlpha', 1.0, ...
     'EdgeColor', [0.15, 0.35, 0.65], 'LineWidth', 1.0);
 % ★ 机体轴三色线：负载自转时若看不出朝向，视觉上会误以为负载变成了一个圆环。
-%   （本构型偏航是欠驱动自由轴，30 s 内自转约 60 度，四角扫出直径 0.28 m 的圆，
-%   而负载厚度只有 0.02 m —— 侧视图上那圈就是扫掠轨迹。）
-%   画上三条体轴后，自转方向与转速一眼可见，不会再被误读。
+%   画上三条体轴后，yaw 参考跟踪、自转方向与转速一眼可见，不会再被误读。
 payloadAxisLines = gobjects(1, 3);
 axisLen = 0.75 * max(cfg.payload.size);
 payloadAxisColors = [0.85, 0.20, 0.15; 0.20, 0.60, 0.25; 0.20, 0.35, 0.85];
@@ -423,8 +430,7 @@ for k = 1:stride:nSteps
         end
     end
 
-    % ★ 标题里显式给出负载偏航角。偏航是欠驱动自由轴（见 README §5.1），
-    %   它会单调漂移；如果不显示出来，用户只会看到负载在转却不知道原因。
+% ★ 标题里显式给出负载偏航角，便于观察 yaw 参考跟踪与是否出现振荡。
     yawNow = atan2(sim.loadRotationLog(2, 1, k), sim.loadRotationLog(1, 1, k));
     set(titleHandle, 'String', sprintf( ...
         ['t = %.2f s | 负载高度 %.3f m | 负载偏航 %.1f deg | ' ...
