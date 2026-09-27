@@ -126,11 +126,11 @@ cfg.vehicle = struct(...
 %   只有当 mu_i 下探到 0 时绳才松弛、负载自由落体，那时才需要额外处理。
 %   本仿真全程 mu_i > 0（min 0.1809 N，裕度 69.2 %），故始终处于绷紧段。
 cfg.link = struct(...
-    'length', 0.35, ...                            % l_i [m]
+    'length', 0.55, ...                            % l_i [m]
     'count', 3, ...                                 % 与 cfg.vehicle.count 保持一致
     'allowTiltedCables', true, ...                 % 允许 q_i 不平行于 e3
     'initialOutwardOffset', NaN, ...                % 初始无人机相对挂点的外张距离 [m]
-    'vehicleClearance', 0.02);                     % 机体中心额外安全间隙 [m]
+    'vehicleClearance', 0.05);                     % 机体中心额外安全间隙 [m]
 
 % ------------------------------------------- 负载位置/姿态外环（论文 (20)-(21)）
 % ★ 重要：论文 (20) 式的等效质量是 **m0**（负载质量），不是 (m0 + sum m_i)。
@@ -690,6 +690,44 @@ cfg.link.initialOutwardOffset = min(max(cfg.link.initialOutwardOffset, 0), ...
 if ~isfield(cfg.vehicle, 'collisionRadius') || isempty(cfg.vehicle.collisionRadius)
     cfg.vehicle.collisionRadius = cfg.vehicle.armLength + cfg.vehicle.rotorRadius;
 end
+
+% ======================================================================
+% ★★★ 外张机制按『碰撞缺口』自适应 —— 2026-09-27 新增
+%
+% 动机：`initialOutwardOffset` 与 `outwardBiasFraction` 原本都是**绝对量**，
+%   与负载尺寸无关。但『无人机之间够不够开』这件事**只在小负载时才需要外张**：
+%     自然机间距 ≈ 挂点间距（随负载尺寸线性增长）
+%     要求机间距 = 2*collisionRadius + vehicleClearance（常数）
+%   实测本参数集（collisionRadius = 0.0695、clearance = 0.02 ⇒ 要求 0.159 m）：
+%     负载边长 0.08 m：无外张时机间距 0.080 m < 0.159 ⇒ 外张**必需**
+%     负载边长 0.15 m：0.150 m < 0.159           ⇒ 外张**必需**（临界）
+%     负载边长 >= 0.20 m：>= 0.200 m >= 0.159     ⇒ 外张**冗余**
+%   而外张内部力的代价是**恒定**的：
+%     min(0.20*m0*g/sqrt(n), outwardBiasMax) = 0.0906 N/机
+%     = 悬停总张力的 11.5%，但 = **2:1:1 里最小那根绳悬停张力的 46.2%**
+%   ⇒ 大负载下它只付代价、不拿收益（白白吃掉最小绳的张力裕度）。
+%
+% 做法：用『缺口比例』缩放两个外张量；大负载时自动归零。
+%   ★ 用户若**显式**给了 outwardBiasFraction / initialOutwardOffset，则尊重用户值，不再缩放。
+%   ★ 控制器无需改动：outwardInternalBias 里的 desired 本身按 fraction 缩放，
+%     fraction 归零 ⇒ desired 归零 ⇒ bias 归零（其内部 `targetRms > 0` 的守卫不会拦）。
+% ======================================================================
+reqSep = 2 * cfg.vehicle.collisionRadius + cfg.link.vehicleClearance;
+natSep = payloadNaturalSeparation(cfg.payload.attachPoints);
+cfg.allocation.collisionRequiredSeparation = reqSep;
+cfg.allocation.payloadNaturalSeparation  = natSep;
+cfg.allocation.outwardBiasScale = min(max((reqSep - natSep) / max(reqSep, eps), 0), 1);
+
+userHasAlloc = isfield(userCfg, 'allocation') && isstruct(userCfg.allocation);
+if ~(userHasAlloc && isfield(userCfg.allocation, 'outwardBiasFraction'))
+    cfg.allocation.outwardBiasFraction = cfg.allocation.outwardBiasFraction ...
+        * cfg.allocation.outwardBiasScale;
+end
+if ~(isfield(userCfg, 'link') && isstruct(userCfg.link) ...
+        && isfield(userCfg.link, 'initialOutwardOffset'))
+    cfg.link.initialOutwardOffset = cfg.link.initialOutwardOffset ...
+        * cfg.allocation.outwardBiasScale;
+end
 userHasInitial = isfield(userCfg, 'initial') && isstruct(userCfg.initial);
 userHasInitialLinks = userHasInitial && isfield(userCfg.initial, 'linkUnits');
 userHasInitialRates = userHasInitial && isfield(userCfg.initial, 'linkRates');
@@ -776,6 +814,22 @@ J = diag([mass * (b^2 + c^2) / 12; ...
           mass * (a^2 + b^2) / 12]);
 end
 
+function value = payloadNaturalSeparation(rhoAll)
+%PAYLOADNATURALSEPARATION 三机在『挂点正上方』(不外加外张偏移) 时的最小两两间距。
+% 用于判断碰撞约束是否真的需要外张：若该值已 >= 要求间距，则外张纯属多余。
+n = size(rhoAll, 2);
+value = inf;
+for i = 1:n
+    for j = i + 1:n
+        value = min(value, norm(rhoAll(:, i) - rhoAll(:, j)));
+    end
+end
+if ~isfinite(value)
+    value = 0;
+end
+end
+
+% ======================================================================
 function qAll = defaultLinkUnits(rhoAll, linkLength, outwardOffset, R0)
 %DEFAULTLINKUNITS 依据挂点径向方向生成外张的初始绳向。
 % q_i 从无人机指向负载；无人机向挂点外侧偏移时，q_i 的水平分量指向内侧。
