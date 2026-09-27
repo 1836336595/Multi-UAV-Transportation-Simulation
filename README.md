@@ -54,23 +54,23 @@ sim = crazyflie_slung_simulation(cfg);
 
 `payload.size = [a; b; c]` 的含义是长、宽、高。默认挂点模板为：
 
-\[
+$$
 \rho_1=(a/2,0,-c/2),\quad
 \rho_2=(-a/2,b/2,-c/2),\quad
 \rho_3=(-a/2,-b/2,-c/2).
-\]
+$$
 
 实际代码通过无量纲 `payload.attachFractions` 乘以 `payload.size` 生成挂点，因此修改尺寸后挂点仍位于负载上表面边界。若显式提供 `userCfg.payload.attachPoints`，该自定义值优先，但必须为 `3 x n` 且列数等于无人机数量。
 
 均质长方体惯量自动计算为：
 
-\[
+$$
 J_0=\operatorname{diag}\left(
 \frac{m_0(b^2+c^2)}{12},
 \frac{m_0(a^2+c^2)}{12},
 \frac{m_0(a^2+b^2)}{12}
 \right).
-\]
+$$
 
 同时自动更新 `payload.inertia`、体积、表面积、外接半径、转动阻尼、`loadController.kR`、`loadController.kOmega`、当前挂点几何对应的悬停张力和初始推力。
 
@@ -94,12 +94,12 @@ cfg.loadController.yawChannelEnabled = true;
 
 控制器先计算负载 SO(3) 姿态误差和期望力矩 `Md`，再通过分配矩阵
 
-\[
+$$
 P=\begin{bmatrix}
 I&I&I\\
 \widehat\rho_1&\widehat\rho_2&\widehat\rho_3
 \end{bmatrix}
-\]
+$$
 
 把合力和合力矩分配到各根缆绳。只要挂点不共线且缆绳有足够倾角，yaw 力矩就可以通过水平张力分量传递。yaw 使用较低带宽，是为了避免直接激励绳索摆动，不代表关闭 yaw 控制。
 
@@ -117,9 +117,9 @@ cfg.link.allowTiltedCables = true;
 
 控制器在满足负载合力和合力矩的最小范数张力解上加入零空间内部力：
 
-\[
+$$
 P\mu_{\mathrm{internal}}=0.
-\]
+$$
 
 因此它不会改变负载的期望合力和合力矩，只会改变各根缆绳的空间分布，使无人机从挂点正上方适度向外侧分开。外张强度由以下参数控制：
 
@@ -132,9 +132,9 @@ cfg.link.vehicleClearance = 0.02;
 
 `initialOutwardOffset` 只用于生成初始绳向；运行过程中缆绳方向由绳向动力学和绳向控制器决定。缆绳长度约束保持：
 
-\[
+$$
 x_i=x_0+R_0\rho_i-l_iq_i,\qquad \|q_i\|=1.
-\]
+$$
 
 自检不再要求 `q_i = e_3` 或无人机水平投影必须在负载上方，而是检查绳长、张力正性、无人机间距、无人机与负载外接包络间隙，以及垂直净空诊断。
 
