@@ -33,15 +33,22 @@ figure('Name', '多机协同吊运仿真结果', 'Color', 'w', ...
     'Position', [70, 50, 1250, 740]);
 
 % ---- (1) 三维轨迹 ----
-% ★ 轴框**不能**按负载轨迹自动适应。原因：负载从 z=0.45 m 爬到 0.35 m
-%   （显示系即从 -0.45 到 -0.35），全程 z 极差 0.797 m，而负载边长只有
-%   0.20 m、绳索 0.35 m —— 轴框被那段"爬升"撑到 0.8 m，负载只占 25 %。
+% ★ 轴框**不能**按负载轨迹自动适应。原因：起飞时负载从地面接触高度爬到
+%   运输高度；如果把初始起飞段和异常过冲一起用于定框，负载边长和绳索都会
+%   被压缩成很小的视觉对象，无法判断是否穿地或是否进入绷紧阶段。
 %   改为以**四旋翼集群在稳态窗口的位置**为中心定框，负载爬升的那一段
 %   会自然伸出框外（视觉上仍然完整可读，因为它是单调上升的一条线）。
-%   子图只画前 trajectoryWindow 秒，避免 0.81 m 的初始瞬态占满画面。
+%   子图只画前 trajectoryWindow 秒，避免起飞/收紧瞬态占满画面。
 subplot(2, 3, 1);
-winEnd = min(nSteps, max(2, round(cfg.visualization.trajectoryWindow / ...
-    cfg.simulation.dt) + 1));
+if isfield(cfg, 'takeoff') && cfg.takeoff.enabled ...
+        && cfg.takeoff.landingEnabled
+    % 起降混合模式下必须把末段 LANDING_RELEASE 也纳入三维轨迹，
+    % 否则用户只能看到起飞和运输，看不到无人机解除绳索后的降落。
+    winEnd = nSteps;
+else
+    winEnd = min(nSteps, max(2, round(cfg.visualization.trajectoryWindow / ...
+        cfg.simulation.dt) + 1));
+end
 winSel = 1:winEnd;
 plot3(loadDisplay(1, winSel), loadDisplay(2, winSel), loadDisplay(3, winSel), ...
     'LineWidth', 1.8, 'Color', [0.00, 0.35, 0.75]);
@@ -97,7 +104,7 @@ xlim([clusterMid(1) - trjHalf, clusterMid(1) + trjHalf]);
 ylim([clusterMid(2) - trjHalf, clusterMid(2) + trjHalf]);
 zlim([clusterMid(3) - trjHalf, clusterMid(3) + trjHalf]);
 xlabel('x (m)'); ylabel('y (m)'); zlabel('高度 (m)');
-title(sprintf('负载与 %d 架四旋翼轨迹（前 %.0f s，稳态局部放大）', n, ...
+title(sprintf('负载与 %d 架四旋翼轨迹（%.0f s，稳态局部放大）', n, ...
     time(winEnd)));
 legendEntries = [{'负载'}, arrayfun(@(i) sprintf('四旋翼 %d', i), 1:n, ...
     'UniformOutput', false), {sprintf('t=%.0fs 处', time(winEnd))}];
@@ -132,10 +139,12 @@ for i = 1:n
 end
 plot([time(1), time(end)], repmat(-cfg.target.position(3), 1, 2), '--', ...
     'Color', [0.85, 0.25, 0.10], 'LineWidth', 1.0);
+plot([time(1), time(end)], [0, 0], ':', ...
+    'Color', [0.15, 0.15, 0.15], 'LineWidth', 1.0);
 xlabel('时间 (s)'); ylabel('高度 (m)');
 title('高度（负载 vs 各四旋翼）');
 legend([{'负载'}, arrayfun(@(i) sprintf('机 %d', i), 1:n, 'UniformOutput', false), ...
-    {'目标高度'}], 'Location', 'best');
+    {'目标高度', '地面'}], 'Location', 'best');
 
 % ---- (5) 各绳索张力（左轴）与各机推力（右轴）----
 subplot(2, 3, 5);
@@ -193,6 +202,31 @@ if ~isempty(yawDesUnwrap)
 else
     title('负载偏航角（yaw 反馈关闭，仅作观测）');
     legend({'实际 yaw'}, 'Location', 'best');
+end
+
+% 起飞/收紧/降落诊断单独成图，避免把绳索松弛时的零张力误读为控制失败。
+if isfield(sim, 'takeoffModeLog') && isfield(sim, 'ropeSlackLog')
+    figure('Name', '绳索状态与起降阶段', 'Color', 'w', ...
+        'Position', [160, 120, 980, 430]);
+    subplot(2, 1, 1);
+    plot(time, sim.ropeSlackLog.', 'LineWidth', 1.1);
+    hold on; grid on;
+    plot(time, zeros(size(time)), 'k:', 'LineWidth', 1.0);
+    ylabel('绳长余量 l-d_i (m)');
+    title('实际定位几何估计的绳索余量（正值=松弛，0=绷紧）');
+    legend(arrayfun(@(i) sprintf('绳索 %d', i), 1:n, 'UniformOutput', false), ...
+        'Location', 'best');
+    subplot(2, 1, 2);
+    stairs(time, sim.takeoffModeLog, 'LineWidth', 1.3, ...
+        'Color', [0.20, 0.35, 0.70]);
+    hold on; grid on;
+    plot(time, sim.tensionScaleLog, '--', 'Color', [0.85, 0.25, 0.15], ...
+        'LineWidth', 1.1);
+    xlabel('时间 (s)'); ylabel('阶段编码 / 张力比例');
+    yticks(0:5);
+    yticklabels({'SLACK', 'TAKEUP', 'RAMP', 'ACTIVE', 'LAND-Taut', 'LAND-Release'});
+    ylim([-0.3, 5.3]);
+    legend({'阶段', '张力软启动比例'}, 'Location', 'best');
 end
 end
 
@@ -399,6 +433,19 @@ for k = 1:stride:nSteps
         attach = pl + [rhoInertial(1); rhoInertial(2); -rhoInertial(3)];
         set(linkLines(i), 'XData', [pv(1), attach(1)], ...
             'YData', [pv(2), attach(2)], 'ZData', [pv(3), attach(3)]);
+        if isfield(sim, 'takeoffModeLog')
+            modeNow = sim.takeoffModeLog(k);
+            if modeNow == 0 || modeNow == 1 || modeNow == 5
+                set(linkLines(i), 'Color', [0.95, 0.55, 0.10], ...
+                    'LineStyle', '--', 'LineWidth', 1.5);
+            elseif modeNow == 2
+                set(linkLines(i), 'Color', [0.95, 0.20, 0.10], ...
+                    'LineStyle', '-', 'LineWidth', 2.2);
+            else
+                set(linkLines(i), 'Color', [0.30, 0.30, 0.30], ...
+                    'LineStyle', '-', 'LineWidth', 2.0);
+            end
+        end
         set(attachMarkers(i), 'XData', attach(1), 'YData', attach(2), ...
             'ZData', attach(3));
 
@@ -425,11 +472,16 @@ for k = 1:stride:nSteps
 
     % ★ 标题里显式给出负载偏航角，便于核对 yaw 参考与实际姿态是否一致。
     yawNow = atan2(sim.loadRotationLog(2, 1, k), sim.loadRotationLog(1, 1, k));
+    modeText = '';
+    if isfield(sim, 'takeoffModeLog')
+        modeText = takeoffModeLabel(sim.takeoffModeLog(k));
+    end
+    slackNow = max(sim.ropeSlackLog(:, k));
     set(titleHandle, 'String', sprintf( ...
-        ['t = %.2f s | 负载高度 %.3f m | 负载偏航 %.1f deg | ' ...
-         '张力 %.3f~%.3f N | 推力峰值 %.1f%%'], ...
-        sim.time(k), -sim.loadPositionLog(3, k), rad2deg(yawNow), ...
-        min(sim.tensionLog(:, k)), max(sim.tensionLog(:, k)), ...
+        ['t = %.2f s | %s | 负载高度 %.3f m | 负载偏航 %.1f deg | ' ...
+         '绳余量 %.3f m | 张力 %.3f~%.3f N | 推力峰值 %.1f%%'], ...
+        sim.time(k), modeText, -sim.loadPositionLog(3, k), rad2deg(yawNow), ...
+        slackNow, min(sim.tensionLog(:, k)), max(sim.tensionLog(:, k)), ...
         max(sim.thrustPctLog(:, k))));
     drawnow;
 
@@ -570,6 +622,25 @@ base = [0.85, 0.33, 0.10; 0.10, 0.55, 0.85; 0.20, 0.65, 0.30; ...
 colors = zeros(n, 3);
 for i = 1:n
     colors(i, :) = base(mod(i - 1, size(base, 1)) + 1, :);
+end
+end
+
+function label = takeoffModeLabel(code)
+switch code
+    case 0
+        label = 'SLACK 松弛';
+    case 1
+        label = 'TAKEUP 收紧';
+    case 2
+        label = 'TAUT_RAMP 软绷紧';
+    case 3
+        label = 'TAUT_ACTIVE 协同运输';
+    case 4
+        label = 'LANDING_TAUT 受控下降';
+    case 5
+        label = 'LANDING_RELEASE 独立降落';
+    otherwise
+        label = 'UNKNOWN';
 end
 end
 

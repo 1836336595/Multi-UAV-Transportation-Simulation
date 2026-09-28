@@ -7,7 +7,7 @@ function cfg = crazyflie_slung_parameters(userCfg)
 %   其 Remark 1 明确要求"每根缆的张力为正"——所以物理上是**绳（cable）**，
 %   不是刚性连杆。绷紧的绳与无质量刚性连杆在力学上完全等价（都只沿 q_i 传轴向力），
 %   差别只有一条：绳多一个单边约束 mu_i >= 0（只能拉，不能推）。
-%   本仿真全程 mu_i > 0（最小 0.1809 N = 悬停值的 69.2 %），故按绷紧绳处理。详见 README §9.7。
+%   TAUT_ACTIVE 段要求 mu_i > 0；起飞/降落的 SLACK 段按零张力处理，详见 README。
 %   负载：    位置 x0、姿态 R0、质量 m0、惯量 J0、挂点 rho_i (i = 1..n)
 %   第 i 机： 质量 m_i、惯量 J_i、绳长 l_i、绳向 q_i（由该机指向负载）
 %   几何约束：x_i = x0 + R0 rho_i - l_i q_i
@@ -124,13 +124,44 @@ cfg.vehicle = struct(...
 % ★ 物理是"绳"：只能受拉（单边约束 mu_i >= 0），不能受压。
 %   绷紧时它的力学与无质量刚性连杆**完全相同**，所以论文的动力学与控制律无需改动；
 %   只有当 mu_i 下探到 0 时绳才松弛、负载自由落体，那时才需要额外处理。
-%   本仿真全程 mu_i > 0（min 0.1809 N，裕度 69.2 %），故始终处于绷紧段。
+%   TAUT_ACTIVE 段的张力必须保持正值；地面起飞前不调用该绷紧段模型。
 cfg.link = struct(...
-    'length', 0.55, ...                            % l_i [m]
+    'length', 0.65, ...                            % l_i [m]
     'count', 3, ...                                 % 与 cfg.vehicle.count 保持一致
     'allowTiltedCables', true, ...                 % 允许 q_i 不平行于 e3
     'initialOutwardOffset', NaN, ...                % 初始无人机相对挂点的外张距离 [m]
     'vehicleClearance', 0.05);                     % 机体中心额外安全间隙 [m]
+
+% --------------------------------------------------------- 起飞/降落混合阶段
+% 这组参数只控制仿真中的地面接触、松弛绳和绷紧过渡，不改变 Lee 的绷紧段
+% 动力学。没有绳端拉力传感器时，TAKEUP -> TAUT_RAMP 使用几何距离判据：
+%   d_i = ||(x_0 + R_0 rho_i) - x_i||,
+% 再配合 epsilonOn/epsilonOff 迟滞，避免定位噪声造成状态抖动。
+% z 轴沿用论文约定（向下为正），所以 groundZ=0、负载中心在地面时为
+% groundZ - payload.size(3)/2，显示时再取反为正高度。
+cfg.takeoff = struct(...
+    'enabled', true, ...
+    'landingEnabled', true, ...
+    'groundZ', 0.0, ...                         % 地面 z 坐标（惯性系）
+    'vehicleGroundClearance', 0.045, ...        % 机体中心离地高度 [m]
+    'groundRadialOffset', NaN, ...              % 起降阶段相对负载中心的安全外张 [m]
+    'independentHoverHeight', 0.30, ...         % 起飞段目标离地高度 [m]
+    'takeoffDuration', 2.5, ...                % 独立起飞到收紧高度 [s]
+    'takeupDuration', 2.5, ...                  % 从收紧高度缓慢接近绳长 [s]
+    'preTensionSlack', 0.012, ...               % 收紧末端保留的绳长余量 [m]
+    'epsilonOn', 0.030, ...                     % 进入绷紧候选的距离余量 [m]
+    'epsilonOff', 0.060, ...                    % 释放判据的距离余量 [m]
+    'confirmTime', 0.30, ...                    % 距离条件持续时间 [s]
+    'tensionRampTime', 1.50, ...                % 张力软建立时间 [s]
+    'landingDuration', 4.0, ...                 % 末段受控下降 + 独立降落 [s]
+    'landingApproachFraction', 0.55, ...        % 前一部分仍由绷紧动力学下降
+    'independentPositionKp', [3.0; 3.0; 4.0], ...
+    'independentPositionKv', [3.12; 3.12; 3.60], ...
+    'independentIntegralGain', [0.80; 0.80; 0.80], ...
+    'independentMaxFeedbackAcceleration', [6.0; 6.0; 8.0], ...
+    'independentIntegralLimit', [0.20; 0.20; 0.20], ...
+    'independentMaxBodyRate', [5.0; 5.0; 3.5], ...
+    'independentHeading', [1; 0; 0]);
 
 % ------------------------------------------- 负载位置/姿态外环（论文 (20)-(21)）
 % ★ 重要：论文 (20) 式的等效质量是 **m0**（负载质量），不是 (m0 + sum m_i)。
@@ -317,7 +348,8 @@ cfg.rateLoop = struct(...
 % 给负载一个明显的初始位置/姿态偏差，各各绳也给不同的初始倾角，
 % 用来验证控制器的收敛能力。
 cfg.initial = struct();
-cfg.initial.position = [0.10; -0.06; 0.45];        % 负载初始位置（z 向下为正）
+cfg.initial.position = [0.10; -0.06; ...
+    cfg.takeoff.groundZ - 0.5 * cfg.payload.size(3)]; % 负载底面初始接触地面
 cfg.initial.velocity = zeros(3, 1);
 cfg.initial.rpy = deg2rad([3; -2; 4]);             % 负载初始姿态
 cfg.initial.loadBodyRate = zeros(3, 1);
@@ -382,7 +414,7 @@ cfg.figureEight = struct(...
     'cruiseDuration', 45.0, ...      % 环绕段时长 [s]（★ 45，原 18，见下）
     'landingDuration', 4.0, ...      % 降落段时长 [s]
     'cruiseHeight', -0.55, ...       % 环绕平面高度 [m]（z 向下为正，故为负）
-    'startPosition', [0.10; -0.06; 0.45], ...   % 起飞起点（与 initial.position 一致）
+    'startPosition', cfg.initial.position, ...   % 起飞起点（与 initial.position 一致）
     'landPosition', [0.00; 0.00; -0.35], ...    % 降落落点（与 target.position 一致）
     'lockYaw', true, ...            % ★ 默认固定参考 yaw，先验证 yaw 闭环本身
     'blendTime', 5.0);               % 环绕段两端的速度过渡时长 [s]（★ 见下）
@@ -690,6 +722,15 @@ cfg.link.initialOutwardOffset = min(max(cfg.link.initialOutwardOffset, 0), ...
 if ~isfield(cfg.vehicle, 'collisionRadius') || isempty(cfg.vehicle.collisionRadius)
     cfg.vehicle.collisionRadius = cfg.vehicle.armLength + cfg.vehicle.rotorRadius;
 end
+if ~isfield(cfg.takeoff, 'groundRadialOffset') ...
+        || ~isscalar(cfg.takeoff.groundRadialOffset) ...
+        || ~isfinite(cfg.takeoff.groundRadialOffset)
+    cfg.takeoff.groundRadialOffset = max(cfg.link.initialOutwardOffset, ...
+        cfg.payload.boundingRadius + cfg.vehicle.collisionRadius ...
+        + cfg.link.vehicleClearance);
+end
+cfg.takeoff.groundRadialOffset = min(max(cfg.takeoff.groundRadialOffset, 0), ...
+    0.85 * cfg.link.length);
 
 % ======================================================================
 % ★★★ 外张机制按『碰撞缺口』自适应 —— 2026-09-27 新增
@@ -729,10 +770,31 @@ if ~(isfield(userCfg, 'link') && isstruct(userCfg.link) ...
         * cfg.allocation.outwardBiasScale;
 end
 userHasInitial = isfield(userCfg, 'initial') && isstruct(userCfg.initial);
+userHasInitialPosition = userHasInitial && isfield(userCfg.initial, 'position');
 userHasInitialLinks = userHasInitial && isfield(userCfg.initial, 'linkUnits');
 userHasInitialRates = userHasInitial && isfield(userCfg.initial, 'linkRates');
 userHasInitialBodyRates = userHasInitial && isfield(userCfg.initial, 'bodyRates');
 userHasInitialThrust = userHasInitial && isfield(userCfg.initial, 'thrustNewton');
+
+% 起飞模型的派生几何和数值检查。若用户没有显式给 initial.position，
+% 始终把负载底面放在 groundZ，避免修改负载厚度后初始位置悬空或穿地。
+if ~userHasInitialPosition
+    cfg.initial.position = [cfg.initial.position(1); cfg.initial.position(2); ...
+        cfg.takeoff.groundZ - 0.5 * cfg.payload.size(3)];
+end
+if ~isfield(cfg, 'takeoff') || ~isstruct(cfg.takeoff)
+    error('crazyflie_slung_parameters:BadTakeoffConfig', ...
+        'cfg.takeoff 必须是结构体。');
+end
+if cfg.takeoff.epsilonOff <= cfg.takeoff.epsilonOn
+    error('crazyflie_slung_parameters:BadTakeoffHysteresis', ...
+        'takeoff.epsilonOff 必须大于 epsilonOn。');
+end
+if cfg.takeoff.preTensionSlack <= 0 || ...
+        cfg.takeoff.preTensionSlack >= cfg.link.length
+    error('crazyflie_slung_parameters:BadTakeupSlack', ...
+        'takeoff.preTensionSlack 必须在 (0, link.length) 内。');
+end
 
 % 用户只改 rpy 时自动重算旋转矩阵
 if ~isfield(userCfg, 'initial') || ~isfield(userCfg.initial, 'rpy')
@@ -742,6 +804,16 @@ elseif ~isfield(userCfg.initial, 'R0')
 end
 if ~isfield(cfg.initial, 'R0')
     cfg.initial.R0 = rpyToRotm(cfg.initial.rpy);
+end
+% 初始姿态可能使长方体的竖直包络大于 H/2。未显式指定初始位置时，
+% 按当前姿态的竖直包络把负载底部放在地面上，避免角部穿地。
+if cfg.takeoff.enabled && ~userHasInitialPosition
+    halfHeight = 0.5 * sum(abs(cfg.initial.R0(3, :)) ...
+        .* cfg.payload.size(:).');
+    cfg.initial.position(3) = cfg.takeoff.groundZ - halfHeight;
+    if isfield(cfg, 'figureEight')
+        cfg.figureEight.startPosition = cfg.initial.position;
+    end
 end
 if ~userHasInitialLinks
     if cfg.link.allowTiltedCables

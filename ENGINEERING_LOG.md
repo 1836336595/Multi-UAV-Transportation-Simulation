@@ -3002,3 +3002,33 @@ u(τ) = aX·wX·cos(wX τ)      v(τ) = (aY/2)·wY·sin(wY τ)
 偏离挂点正上方，碰撞自检改为检查中心距包络、绳长不变量和垂直净空诊断。
 只有在用户显式提供 `payload.attachPoints`、`payload.inertia` 或阻尼时，才保留
 这些覆盖值。
+
+### 14.8 ★ 地面起飞与无拉力传感器的混合仿真（2026-09-28）
+
+当前仿真不再默认从“绳索已经绷紧”的约束状态开始。`crazyflie_slung_simulation.m`
+新增混合状态：`SLACK -> TAKEUP -> TAUT_RAMP -> TAUT_ACTIVE`，末段经过
+`LANDING_TAUT -> LANDING_RELEASE`。`SLACK/TAKEUP/LANDING_RELEASE` 中，
+无人机位置和速度作为独立状态积分，单机控制器见
+`crazyflie_slung_independent_controller.m`，实现方式与 `v2` 的几何位置 PID、
+推力方向和 SO(3) 姿态环一致；负载在 `SLACK` 和释放后的降落阶段由地面接触固定。
+
+没有绳端拉力传感器时，绳索状态由挂点到无人机的实际定位距离估计，
+`epsilonOn/epsilonOff + confirmTime` 提供迟滞。只有进入 `TAUT_RAMP` 后才恢复
+Lee 2014/2018 的固定绳长动力学；张力软启动期间使用五次 smoothstep，避免地面
+接触时出现张力阶跃。`sim.ropeDistanceLog`、`sim.ropeSlackLog`、
+`sim.takeoffModeLog` 和 `sim.tensionScaleLog` 是新增诊断量。绷紧段的
+`sim.tensionLog` 仍是模型估计/指令张力，不应当当作实测拉力。
+
+截图暴露的起飞故障已按物理和代码链路复核：负载位置误差恒定、绳索张力为零，
+表明仿真没有进入 `TAUT_RAMP`，而不是运输控制器没有输出；无人机轨迹穿过高度零，
+说明松弛阶段仅做位置跟踪、没有地面不可穿透条件。独立控制器原先把
+`-Kp*ep-Kv*ev` 直接作为牛顿力，与增益作为加速度增益的定义不一致；现统一将
+位置/速度/积分加速度项与重力、参考加速度合并后乘以无人机质量，并增加反馈加速度
+限幅。起飞积分后对无人机施加机体中心地面间隙约束，负载接触高度按其当前 SO(3)
+姿态下长方体竖直包络计算。`TAKEUP` 的五次插值现在同时输出解析速度和加速度前馈，
+距离判据要求实际绳距不超过绳长，避免把超过绳长的不可实现状态判作已绷直。
+
+新增自检要求状态机至少进入 `TAUT_RAMP/ACTIVE/LANDING_TAUT` 之一，并检查
+无人机与负载的最大地面穿透；摘要额外打印模式码、首次绷紧时刻和最终绳长/余量。
+本次仅做静态与代数核对，没有启动 MATLAB；必须在用户本地运行 demo 后确认状态码
+实际经过 2/3，且绷紧阶段张力和负载高度曲线符合预期，再把结果作为仿真验证。

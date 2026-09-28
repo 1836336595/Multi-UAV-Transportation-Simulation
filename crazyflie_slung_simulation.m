@@ -22,7 +22,9 @@ function sim = crazyflie_slung_simulation(userCfg)
 %            |
 %   完整动力学 (5)-(8) 积分
 %
-% 本文件只做：初始化、调用控制器、模拟内外环执行机构、积分动力学、记录数据。
+% 本文件只做：初始化、处理地面起降混合状态、调用控制器、模拟内外环执行机构、
+% 积分动力学和记录数据。松弛阶段的无人机位置独立积分；绷紧阶段才使用论文
+% 的固定绳长约束。
 
 if nargin < 1 || isempty(userCfg)
     userCfg = struct();
@@ -41,6 +43,16 @@ state.loadPosition = cfg.initial.position(:);
 state.loadVelocity = cfg.initial.velocity(:);
 state.loadRotation = projectSO3(cfg.initial.R0);
 state.loadBodyRate = cfg.initial.loadBodyRate(:);
+% 初始负载必须满足地面不可穿透约束。z 轴向下为正，所以允许的最大
+% z 坐标是 groundZ 减去当前姿态下长方体的竖直半包络高度。
+if cfg.takeoff.enabled
+    initialGroundLoadZ = cfg.takeoff.groundZ ...
+        - payloadGroundHalfHeight(state.loadRotation, cfg.payload.size);
+    if state.loadPosition(3) > initialGroundLoadZ
+        state.loadPosition(3) = initialGroundLoadZ;
+        state.loadVelocity(3) = 0;
+    end
+end
 state.linkUnits = zeros(3, n);
 state.linkRates = zeros(3, n);
 for i = 1:n
@@ -54,6 +66,16 @@ for i = 1:n
     state.rotations(:, :, i) = projectSO3(cfg.initial.vehicleR(:, :, i));
     state.bodyRates(:, i) = cfg.initial.bodyRates(:, i);
 end
+% 松弛绳阶段必须把无人机位置作为独立状态积分；绷紧后再回到论文的
+% x_i = x_0 + R_0 rho_i - l_i q_i 约束。这样动画中的绳长不会在起飞时
+% 被错误地“瞬间拉满”。
+if cfg.takeoff.enabled
+    state.vehiclePosition = initialVehiclePositions(state.loadPosition, ...
+        state.loadRotation, cfg, false);
+else
+    state.vehiclePosition = constrainedVehiclePositions(state, cfg);
+end
+state.vehicleVelocity = zeros(3, n);
 state.loadAcceleration = zeros(3, 1);
 state.loadBodyAcceleration = zeros(3, 1);
 
@@ -66,12 +88,40 @@ if isscalar(cfg.initial.thrustNewton)
 else
     actualThrust = reshape(cfg.initial.thrustNewton, 1, n);
 end
+if cfg.takeoff.enabled
+    % 真机起飞阶段电机从零推力开始，由独立位置控制器逐步建立悬停推力；
+    % 不能把绷紧悬停解直接作为地面初始推力，否则动画会出现瞬时跳起。
+    actualThrust = zeros(1, n);
+end
 
 % 控制器跨步状态
 memory = struct();
 memory.positionIntegral = zeros(3, 1);
 memory.linkIntegrals = zeros(3, n);
 memory.previousLinkUnits = [];
+memory.independentPositionIntegral = zeros(3, n);
+
+% 混合状态：独立起飞/收紧 -> 绷紧段 -> 独立释放/降落。
+if cfg.takeoff.enabled
+    mode = 'SLACK';
+else
+    mode = 'ACTIVE';
+end
+modeStartTime = 0;
+tautCandidateStart = nan;
+tautStartTime = nan;
+landingStartPosition = state.loadPosition;
+groundLoadPosition = state.loadPosition;
+groundLoadPosition(3) = cfg.takeoff.groundZ ...
+    - payloadGroundHalfHeight(state.loadRotation, cfg.payload.size);
+if cfg.takeoff.landingEnabled && cfg.simulation.duration > ...
+        cfg.takeoff.takeoffDuration + cfg.takeoff.takeupDuration ...
+        + cfg.takeoff.tensionRampTime + cfg.takeoff.landingDuration
+    landingStartTime = cfg.simulation.duration - cfg.takeoff.landingDuration;
+else
+    % 快速冒烟仿真太短时不强行插入降落段，至少保留独立起飞/收紧过程。
+    landingStartTime = inf;
+end
 
 % ------------------------------------------------------------------ 日志分配
 sim = struct();
@@ -82,6 +132,10 @@ sim.loadVelocityLog = zeros(3, nSteps);   % ★ 状态量，必须记录（见�
 sim.loadRotationLog = zeros(3, 3, nSteps);
 sim.linkUnitLog = zeros(3, n, nSteps);
 sim.vehiclePositionLog = zeros(3, n, nSteps);
+sim.ropeDistanceLog = zeros(n, nSteps);
+sim.ropeSlackLog = zeros(n, nSteps);
+sim.takeoffModeLog = zeros(1, nSteps);
+sim.tensionScaleLog = zeros(1, nSteps);
 sim.rotationLog = zeros(3, 3, n, nSteps);
 sim.bodyRateLog = zeros(3, n, nSteps);
 sim.linkRateLog = zeros(3, n, nSteps);
@@ -130,8 +184,215 @@ for k = 1:nSteps
     t = time(k);
     desired = referenceState(t, cfg);
 
+    % --------------------------- 独立起飞/收紧/释放阶段 ------------------
+    % 松弛绳阶段不调用绷紧段张力分配。无人机用 v2 的几何 PID 独立飞行，
+    % 负载由地面接触约束固定；绳向 q_i 仅由实际定位几何估计，不需要拉力传感器。
+    if cfg.takeoff.enabled && strcmp(mode, 'ACTIVE') ...
+            && cfg.takeoff.landingEnabled && t >= landingStartTime
+        mode = 'LANDING_TAUT';
+        modeStartTime = t;
+        landingStartPosition = state.loadPosition;
+    elseif cfg.takeoff.enabled && cfg.takeoff.landingEnabled ...
+            && t >= landingStartTime ...
+            && (strcmp(mode, 'SLACK') || strcmp(mode, 'TAKEUP') ...
+            || strcmp(mode, 'TAUT_RAMP'))
+        % 若绷紧条件在规定时间内没有满足，也不能让仿真停在“半空等待”。
+        % 没有拉力传感器时按保守策略释放并回到地面，日志会保留未绷紧事实。
+        mode = 'LANDING_RELEASE';
+        modeStartTime = t;
+        state.loadPosition = groundLoadPosition;
+        state.loadVelocity = zeros(3, 1);
+        state.loadBodyRate = zeros(3, 1);
+        state.vehicleVelocity = zeros(3, n);
+    end
+
+    if cfg.takeoff.enabled && strcmp(mode, 'SLACK') ...
+            && t >= cfg.takeoff.takeoffDuration
+        mode = 'TAKEUP';
+        modeStartTime = t;
+    end
+
+    if cfg.takeoff.enabled && (strcmp(mode, 'SLACK') ...
+            || strcmp(mode, 'TAKEUP') || strcmp(mode, 'LANDING_RELEASE'))
+        if strcmp(mode, 'LANDING_RELEASE')
+            state.loadPosition = groundLoadPosition;
+            state.loadVelocity = zeros(3, 1);
+            state.loadBodyRate = zeros(3, 1);
+            [desiredVehicle, desiredVehicleVelocity, desiredVehicleAcceleration] = ...
+                independentVehicleTargets(groundLoadPosition, ...
+                state.loadRotation, cfg, 'LANDING_RELEASE', t, modeStartTime);
+        else
+            [desiredVehicle, desiredVehicleVelocity, desiredVehicleAcceleration] = ...
+                independentVehicleTargets(groundLoadPosition, ...
+                state.loadRotation, cfg, mode, t, modeStartTime);
+        end
+        [command, memory] = crazyflie_slung_independent_controller(...
+            state, desiredVehicle, desiredVehicleVelocity, ...
+            desiredVehicleAcceleration, memory, cfg);
+
+        % 独立阶段日志：张力为零，ropeDistance/slack 来自真实位置。
+        sim.commandLog(k) = logCommand(command, n);
+        sim.tensionLog(:, k) = zeros(n, 1);
+        sim.linkErrorLog(:, k) = zeros(n, 1);
+        sim.attitudeErrorLog(:, k) = sqrt(sum(command.attitudeErrors.^2, 1)).';
+        sim.loadAttitudeErrorLog(:, k) = zeros(3, 1);
+        sim.loadBodyRateLog(:, k) = state.loadBodyRate;
+        sim.loadYawRefLog(k) = atan2(desired.rotation(2, 1), desired.rotation(1, 1));
+        actualYaw = atan2(state.loadRotation(2, 1), state.loadRotation(1, 1));
+        sim.loadYawLog(k) = actualYaw;
+        sim.loadYawErrorLog(k) = wrapAngle(actualYaw - sim.loadYawRefLog(k));
+        sim.positionErrorLog(k) = norm(state.loadPosition - desired.position(:));
+        sim.positionErrorVectorLog(:, k) = state.loadPosition - desired.position(:);
+        sim.omegaCommandLog(:, :, k) = command.omegaCommands;
+        sim.desiredTensionLog(:, :, k) = zeros(3, n);
+        sim.loadPositionLog(:, k) = state.loadPosition;
+        sim.loadVelocityLog(:, k) = state.loadVelocity;
+        sim.loadRotationLog(:, :, k) = state.loadRotation;
+        sim.loadBodyRateLog(:, k) = state.loadBodyRate;
+        sim.rotationLog(:, :, :, k) = state.rotations;
+        sim.bodyRateLog(:, :, k) = state.bodyRates;
+        sim.parallelForceLog(:, :, k) = zeros(3, n);
+        sim.perpendicularForceLog(:, :, k) = zeros(3, n);
+        sim.totalForceLog(:, :, k) = command.totalForces;
+        sim.thrustPctLog(:, k) = command.thrustPercentage(:);
+        sim.vehiclePositionLog(:, :, k) = state.vehiclePosition;
+        sim.takeoffModeLog(k) = modeCode(mode);
+        sim.tensionScaleLog(k) = 0;
+
+        if k < nSteps
+            % 推力执行器和等效速率环，与绷紧段使用同一套 Crazyflie 模型。
+            alphaThrust = min(1, dt / max(cfg.vehicle.thrustTimeConstant, eps));
+            actualThrust = actualThrust + alphaThrust * ...
+                (command.thrustDesired(:).' - actualThrust);
+            actualThrust = min(max(actualThrust, 0), cfg.vehicle.maxTotalThrust);
+            sim.thrustLog(:, k + 1) = actualThrust(:);
+
+            for i = 1:n
+                rateError = command.omegaCommands(:, i) - state.bodyRates(:, i);
+                bodyRateDotCmd = cfg.rateLoop.bandwidth .* rateError;
+                Omegai = state.bodyRates(:, i);
+                moment = cfg.vehicle.inertia * bodyRateDotCmd ...
+                    + cross(Omegai, cfg.vehicle.inertia * Omegai);
+                state.bodyTorques(:, i) = moment;
+                sim.momentLog(:, i, k + 1) = moment;
+            end
+
+            uActual = zeros(3, n);
+            for i = 1:n
+                uActual(:, i) = -actualThrust(i) ...
+                    * (state.rotations(:, :, i) * [0; 0; 1]);
+                acceleration = cfg.vehicle.gravity * [0; 0; 1] ...
+                    + uActual(:, i) / cfg.vehicle.mass;
+                state.vehicleVelocity(:, i) = state.vehicleVelocity(:, i) ...
+                    + dt * acceleration;
+                state.vehiclePosition(:, i) = state.vehiclePosition(:, i) ...
+                    + dt * state.vehicleVelocity(:, i);
+                % 地面是不可穿透边界。物理坐标 z 向下为正，因此
+                % vehicleGroundZ 是机体中心允许达到的最大 z 值。
+                vehicleGroundZ = cfg.takeoff.groundZ ...
+                    - cfg.takeoff.vehicleGroundClearance;
+                if state.vehiclePosition(3, i) > vehicleGroundZ
+                    state.vehiclePosition(3, i) = vehicleGroundZ;
+                    if state.vehicleVelocity(3, i) > 0
+                        state.vehicleVelocity(3, i) = 0;
+                    end
+                end
+                state.bodyRates(:, i) = state.bodyRates(:, i) ...
+                    + dt * (cfg.vehicle.inertia \ ...
+                    (state.bodyTorques(:, i) ...
+                    - cross(state.bodyRates(:, i), ...
+                    cfg.vehicle.inertia * state.bodyRates(:, i))));
+                state.bodyRates(:, i) = clampVector(state.bodyRates(:, i), ...
+                    -cfg.simulation.maxBodyRate, cfg.simulation.maxBodyRate);
+                state.rotations(:, :, i) = projectSO3(state.rotations(:, :, i) ...
+                    * expSO3(state.bodyRates(:, i) * dt));
+            end
+
+            [ropeDistance, ropeSlack, qNew, qdNew] = ...
+                ropeGeometryFromVehicles(state, cfg);
+            state.linkUnits = qNew;
+            state.linkRates = qdNew;
+            sim.ropeDistanceLog(:, k) = ropeDistance(:);
+            sim.ropeSlackLog(:, k) = ropeSlack(:);
+
+            if strcmp(mode, 'TAKEUP')
+                % 只有“未超过绳长且余量足够小”才算接近绷直。
+                % 仅使用 abs(distance-l) 会把超过绳长的不可实现状态也
+                % 当成候选，随后把绳索瞬间投影成刚性约束。
+                nearOn = ropeDistance <= cfg.link.length ...
+                    & (cfg.link.length - ropeDistance) <= cfg.takeoff.epsilonOn;
+                nearOff = ropeDistance <= cfg.link.length ...
+                    & (cfg.link.length - ropeDistance) <= cfg.takeoff.epsilonOff;
+                if isnan(tautCandidateStart)
+                    allNear = all(nearOn);
+                else
+                    allNear = all(nearOff);
+                end
+                if allNear
+                    if isnan(tautCandidateStart)
+                        tautCandidateStart = t;
+                    end
+                else
+                    tautCandidateStart = nan;
+                end
+                holdTime = t - tautCandidateStart;
+                if allNear && holdTime >= cfg.takeoff.confirmTime
+                    mode = 'TAUT_RAMP';
+                    modeStartTime = t;
+                    tautStartTime = t;
+                    memory.linkIntegrals = zeros(3, n);
+                    memory.previousLinkUnits = state.linkUnits;
+                end
+            end
+        end
+        continue;
+    end
+
+    % LANDING_TAUT 仍使用绷紧段动力学，但把期望负载平滑地送到地面。
+    if cfg.takeoff.enabled && strcmp(mode, 'LANDING_TAUT')
+        approachDuration = max(0.1, cfg.takeoff.landingDuration ...
+            * cfg.takeoff.landingApproachFraction);
+        sLanding = clamp((t - modeStartTime) / approachDuration, 0, 1);
+        blend = smoothStep5(sLanding);
+        desired.position = (1 - blend) * landingStartPosition ...
+            + blend * groundLoadPosition;
+        desired.velocity = zeros(3, 1);
+        desired.acceleration = zeros(3, 1);
+        desired.rotation = state.loadRotation;
+        desired.bodyRate = zeros(3, 1);
+        desired.bodyRateDot = zeros(3, 1);
+    end
+
     % -------- 控制器 --------
     [command, memory] = crazyflie_slung_controller(state, desired, memory, cfg);
+
+    % 绷紧瞬间不要把完整张力阶跃施加到地面负载。把各机期望作用力从
+    % 独立悬停力平滑过渡到论文绷紧段作用力；这只是接触阶段的数值/物理
+    % 过渡，TAUT_ACTIVE 中仍完全使用原控制律。
+    tensionScale = 1.0;
+    if strcmp(mode, 'TAUT_RAMP')
+        rampS = clamp((t - tautStartTime) / ...
+            max(cfg.takeoff.tensionRampTime, eps), 0, 1);
+        tensionScale = smoothStep5(rampS);
+        uHover = -cfg.vehicle.mass * cfg.vehicle.gravity * [0; 0; 1];
+        uBlend = repmat(uHover, 1, n) ...
+            + tensionScale * (command.totalForces - repmat(uHover, 1, n));
+        command.totalForces = uBlend;
+        command.parallelForces = tensionScale * command.parallelForces ...
+            + (1 - tensionScale) * repmat(uHover, 1, n);
+        command.perpendicularForces = tensionScale * command.perpendicularForces;
+        command.desiredTensions = tensionScale * command.desiredTensions;
+        command.tensions = tensionScale * command.tensions;
+        command.thrustDesired = zeros(1, n);
+        for i = 1:n
+            command.thrustDesired(i) = clamp(-dot(uBlend(:, i), ...
+                state.rotations(:, :, i) * [0; 0; 1]), ...
+                0, cfg.vehicle.maxTotalThrust);
+        end
+        command.thrustPercentage = 100 * command.thrustDesired ...
+            / cfg.vehicle.maxTotalThrust;
+        command.totalThrust = sum(command.thrustDesired);
+    end
     sim.commandLog(k) = logCommand(command, n);
     sim.tensionLog(:, k) = command.tensions(:);
     sim.linkErrorLog(:, k) = sqrt(sum(command.linkDirectionErrors.^2, 1)).';
@@ -153,6 +414,8 @@ for k = 1:nSteps
     sim.positionErrorVectorLog(:, k) = command.positionError;
     sim.omegaCommandLog(:, :, k) = command.omegaCommands;
     sim.desiredTensionLog(:, :, k) = command.desiredTensions;
+    sim.takeoffModeLog(k) = modeCode(mode);
+    sim.tensionScaleLog(k) = tensionScale;
 
     % 记录当前状态
     sim.loadPositionLog(:, k) = state.loadPosition;
@@ -170,9 +433,13 @@ for k = 1:nSteps
     sim.totalForceLog(:, :, k) = command.totalForces;
     sim.thrustPctLog(:, k) = command.thrustPercentage(:);
     for i = 1:n
-        sim.vehiclePositionLog(:, i, k) = state.loadPosition ...
+        state.vehiclePosition(:, i) = state.loadPosition ...
             + state.loadRotation * rhoAll(:, i) ...
             - cfg.link.length * state.linkUnits(:, i);
+        sim.vehiclePositionLog(:, i, k) = state.vehiclePosition(:, i);
+        attachPoint = state.loadPosition + state.loadRotation * rhoAll(:, i);
+        sim.ropeDistanceLog(i, k) = norm(attachPoint - state.vehiclePosition(:, i));
+        sim.ropeSlackLog(i, k) = cfg.link.length - sim.ropeDistanceLog(i, k);
     end
 
     if k == nSteps
@@ -293,6 +560,48 @@ for k = 1:nSteps
         end
     end
 
+    % 地面接触和混合状态切换。负载中心不能低于“底面接触地面”的位置；
+    % 这一步避免绷紧/降落阶段出现数值穿地，也让可视化中的接触过程可信。
+    if cfg.takeoff.enabled
+        % z 轴向下为正：超过该值表示负载底面已经穿过地面。
+        currentGroundLoadZ = cfg.takeoff.groundZ ...
+            - payloadGroundHalfHeight(state.loadRotation, cfg.payload.size);
+        if state.loadPosition(3) > currentGroundLoadZ
+            state.loadPosition(3) = currentGroundLoadZ;
+            if state.loadVelocity(3) > 0
+                state.loadVelocity(3) = 0;
+            end
+        end
+    end
+
+    if cfg.takeoff.enabled && strcmp(mode, 'LANDING_TAUT')
+        approachDuration = max(0.1, cfg.takeoff.landingDuration ...
+            * cfg.takeoff.landingApproachFraction);
+        if t >= modeStartTime + approachDuration
+            state.loadPosition = groundLoadPosition;
+            state.loadVelocity = zeros(3, 1);
+            state.loadBodyRate = zeros(3, 1);
+            mode = 'LANDING_RELEASE';
+            modeStartTime = t;
+            state.vehiclePosition = constrainedVehiclePositions(state, cfg);
+            state.vehicleVelocity = zeros(3, n);
+            [~, ~, state.linkUnits, state.linkRates] = ...
+                ropeGeometryFromVehicles(state, cfg);
+        end
+    elseif cfg.takeoff.enabled && strcmp(mode, 'TAUT_RAMP') ...
+            && t >= tautStartTime + cfg.takeoff.tensionRampTime
+        if state.loadPosition(3) > groundLoadPosition(3)
+            state.loadPosition(3) = groundLoadPosition(3);
+            state.loadVelocity(3) = 0;
+        end
+        mode = 'ACTIVE';
+        modeStartTime = t;
+    elseif cfg.takeoff.enabled && strcmp(mode, 'TAUT_RAMP') ...
+            && state.loadPosition(3) > groundLoadPosition(3)
+        state.loadPosition(3) = groundLoadPosition(3);
+        state.loadVelocity(3) = 0;
+    end
+
     % -------- 绳索约束投影：保持 q_i' q_dot_i ≡ 0 --------
     % ★ 与"绳 vs 刚性连杆"直接相关，不要删 ★
     %
@@ -323,10 +632,20 @@ end
 % 补最后一步的记录
 sim.thrustLog(:, nSteps) = actualThrust(:);
 for i = 1:n
-    sim.vehiclePositionLog(:, i, nSteps) = state.loadPosition ...
-        + state.loadRotation * rhoAll(:, i) ...
-        - cfg.link.length * state.linkUnits(:, i);
+    if cfg.takeoff.enabled && (strcmp(mode, 'SLACK') ...
+            || strcmp(mode, 'TAKEUP') || strcmp(mode, 'LANDING_RELEASE'))
+        state.vehiclePosition(:, i) = state.vehiclePosition(:, i);
+    else
+        state.vehiclePosition(:, i) = state.loadPosition ...
+            + state.loadRotation * rhoAll(:, i) ...
+            - cfg.link.length * state.linkUnits(:, i);
+    end
+    sim.vehiclePositionLog(:, i, nSteps) = state.vehiclePosition(:, i);
+    attachPoint = state.loadPosition + state.loadRotation * rhoAll(:, i);
+    sim.ropeDistanceLog(i, nSteps) = norm(attachPoint - state.vehiclePosition(:, i));
+    sim.ropeSlackLog(i, nSteps) = cfg.link.length - sim.ropeDistanceLog(i, nSteps);
 end
+sim.takeoffModeLog(nSteps) = modeCode(mode);
 
 % ★ 把"坏步计数"挂到 sim 上再进 computeSummary。
 %   ⚠ 不能直接写 `summary.x = nonFiniteStepCount` —— computeSummary 是**另一个函数**，
@@ -581,6 +900,43 @@ end
 summary.loadPositionFinal = loadPosition(:, end);
 summary.loadHeightFinal = loadHeight(end);
 summary.vehicleHeightFinal = vehicleHeight(:, end);
+if isfield(sim, 'takeoffModeLog')
+    summary.takeoffModeFinal = sim.takeoffModeLog(end);
+    summary.takeoffModeCodesSeen = unique(sim.takeoffModeLog);
+    summary.tautTransitionOccurred = any(sim.takeoffModeLog == 2 ...
+        | sim.takeoffModeLog == 3 | sim.takeoffModeLog == 4);
+    summary.firstTautTime = NaN;
+    firstTautIndex = find(sim.takeoffModeLog == 2 | sim.takeoffModeLog == 3 ...
+        | sim.takeoffModeLog == 4, 1, 'first');
+    if ~isempty(firstTautIndex)
+        summary.firstTautTime = sim.time(firstTautIndex);
+    end
+    summary.finalRopeDistance = sim.ropeDistanceLog(:, end);
+    summary.finalRopeSlack = sim.ropeSlackLog(:, end);
+else
+    summary.takeoffModeFinal = 3;
+    summary.takeoffModeCodesSeen = 3;
+    summary.tautTransitionOccurred = true;
+    summary.firstTautTime = 0;
+    summary.finalRopeDistance = repmat(cfg.link.length, n, 1);
+    summary.finalRopeSlack = zeros(n, 1);
+end
+if cfg.takeoff.enabled
+    vehicleGroundZ = cfg.takeoff.groundZ - cfg.takeoff.vehicleGroundClearance;
+    summary.maxVehicleGroundPenetration = max(0, max(sim.vehiclePositionLog(3, :, :), [], 'all') ...
+        - vehicleGroundZ);
+    payloadGroundZ = zeros(1, nSteps);
+    for k = 1:nSteps
+        payloadGroundZ(k) = cfg.takeoff.groundZ ...
+            - payloadGroundHalfHeight(sim.loadRotationLog(:, :, k), ...
+            cfg.payload.size);
+    end
+    summary.maxPayloadGroundPenetration = max(0, ...
+        max(loadPosition(3, :) - payloadGroundZ));
+else
+    summary.maxVehicleGroundPenetration = 0;
+    summary.maxPayloadGroundPenetration = 0;
+end
 % yaw 误差必须逐点包角后再统计，避免 ±pi 处产生假大误差
 if isfield(sim, 'loadYawErrorLog')
     yawError = sim.loadYawErrorLog(:).';
@@ -630,8 +986,34 @@ summary.maxBodyRate = max(abs(sim.bodyRateLog(:)));
 summary.maxThrustPercentage = max(sim.thrustPctLog(:));
 summary.minTension = min(sim.tensionLog(:));
 summary.maxTension = max(sim.tensionLog(:));
-summary.steadyTension = mean(sim.tensionLog(:, steadyIndex), 2);   % n x 1
-summary.allTensionsPositive = all(sim.tensionLog(:) > 0);
+tautMask = true(1, nSteps);
+if isfield(sim, 'takeoffModeLog')
+    tautMask = sim.takeoffModeLog == 2 | sim.takeoffModeLog == 3 ...
+        | sim.takeoffModeLog == 4;
+end
+summary.hasTautPhase = any(tautMask);
+positiveTensionMask = sim.takeoffModeLog == 3 | sim.takeoffModeLog == 4;
+if any(positiveTensionMask)
+    summary.minTautTension = min(sim.tensionLog(:, positiveTensionMask), [], 'all');
+    summary.maxTautTension = max(sim.tensionLog(:, positiveTensionMask), [], 'all');
+else
+    summary.minTautTension = 0;
+    summary.maxTautTension = 0;
+end
+steadyTensionIndex = steadyIndex(tautMask(steadyIndex));
+if isempty(steadyTensionIndex)
+    steadyTensionIndex = find(tautMask);
+end
+if isempty(steadyTensionIndex)
+    summary.steadyTension = zeros(n, 1);
+else
+    summary.steadyTension = mean(sim.tensionLog(:, steadyTensionIndex), 2);
+end
+if any(positiveTensionMask)
+    summary.allTensionsPositive = all(sim.tensionLog(:, positiveTensionMask) > 0, 'all');
+else
+    summary.allTensionsPositive = true;
+end
 
 % 无人机碰撞诊断：用机臂长度+旋翼半径作为保守水平包络半径。
 % 绳索允许倾斜后，车辆中心不再被强制固定在挂点正上方；这里直接检查
@@ -679,6 +1061,9 @@ summary.vehiclePayloadClearanceMargin = minVehiclePayloadClearance ...
 maxRopeLengthDrift = 0;
 rhoAll = cfg.payload.attachPoints;      % computeSummary 的作用域里没有外部 rhoAll
 for k = 1:nSteps
+    if ~tautMask(k)
+        continue;
+    end
     for i = 1:n
         attachPoint = sim.loadPositionLog(:, k) ...
             + sim.loadRotationLog(:, :, k) * rhoAll(:, i);
@@ -688,7 +1073,8 @@ for k = 1:nSteps
     end
 end
 summary.maxRopeLengthDrift = maxRopeLengthDrift;
-summary.ropeLengthInvariantHolds = maxRopeLengthDrift < 1e-9;
+summary.ropeLengthInvariantHolds = ~summary.hasTautPhase ...
+    || maxRopeLengthDrift < 1e-9;
 
 % 倾斜缆绳下，车辆可以明显偏离负载的水平投影，不能再要求“在负载正上方”。
 % 保留旧字段以兼容外部脚本，但它现在只表示垂直净空诊断，不参与控制律。
@@ -697,7 +1083,9 @@ summary.minVehicleVerticalClearance = min(verticalClearance(:));
 summary.allVehiclesAboveLoad = summary.minVehicleVerticalClearance > 0;
 summary.minLinkVerticalComponent = min(sim.linkUnitLog(3, :, :), [], 'all');
 summary.finiteState = all(isfinite(loadPosition(:))) ...
-    && all(isfinite(sim.linkUnitLog(:))) && all(isfinite(sim.bodyRateLog(:)));
+    && all(isfinite(sim.linkUnitLog(:))) && all(isfinite(sim.bodyRateLog(:))) ...
+    && all(isfinite(sim.vehiclePositionLog(:))) ...
+    && all(isfinite(sim.ropeDistanceLog(:)));
 % ★ 坏步计数：> 0 说明代数系统曾经出现非有限量（即使状态日志看起来正常）。
 %   自检必须同时要求这一项为 0，否则"发散"会被坏步保护掩盖成"通过"。
 if isfield(sim, 'nonFiniteSolveCount')
@@ -840,6 +1228,159 @@ summary.hoverThrustPercentage = 100 * summary.hoverThrustByVehicle ...
     / cfg.vehicle.maxTotalThrust;
 summary.thrustToWeightRatio = n * cfg.vehicle.maxTotalThrust ...
     / ((cfg.payload.mass + n * cfg.vehicle.mass) * cfg.vehicle.gravity);
+end
+
+% ======================================================================
+function positions = initialVehiclePositions(loadPosition, loadRotation, cfg, useTakeupHeight)
+% 初始时无人机在地面附近，绳索必然松弛；随后由独立控制器起飞。
+n = cfg.vehicle.count;
+rhoAll = cfg.payload.attachPoints;
+positions = zeros(3, n);
+for i = 1:n
+    attach = loadPosition + loadRotation * rhoAll(:, i);
+    radial = horizontalRadial(rhoAll(:, i), i, n);
+    positions(:, i) = attach + cfg.takeoff.groundRadialOffset * radial;
+    if useTakeupHeight
+        positions(:, i) = vehicleTakeupPosition(attach, radial, cfg);
+    else
+        positions(3, i) = cfg.takeoff.groundZ ...
+            - cfg.takeoff.vehicleGroundClearance;
+    end
+end
+end
+
+function positions = constrainedVehiclePositions(state, cfg)
+n = cfg.vehicle.count;
+positions = zeros(3, n);
+for i = 1:n
+    positions(:, i) = state.loadPosition ...
+        + state.loadRotation * cfg.payload.attachPoints(:, i) ...
+        - cfg.link.length * state.linkUnits(:, i);
+end
+end
+
+function [positions, velocities, accelerations] = ...
+    independentVehicleTargets(loadPosition, loadRotation, cfg, mode, t, modeStartTime)
+% 返回每架独立飞行阶段的目标位置。TAKEUP 目标是 l-preTensionSlack，
+% 因此不会在尚未确认所有绳索接近绷直时提前切换到耦合动力学。
+n = cfg.vehicle.count;
+rhoAll = cfg.payload.attachPoints;
+positions = zeros(3, n);
+velocities = zeros(3, n);
+accelerations = zeros(3, n);
+for i = 1:n
+    attach = loadPosition + loadRotation * rhoAll(:, i);
+    radial = horizontalRadial(rhoAll(:, i), i, n);
+    if strcmp(mode, 'TAKEUP')
+        takeupPosition = vehicleTakeupPosition(attach, radial, cfg);
+        hoverPosition = attach + cfg.takeoff.groundRadialOffset * radial;
+        hoverPosition(3) = cfg.takeoff.groundZ ...
+            - cfg.takeoff.independentHoverHeight;
+        takeupDuration = max(cfg.takeoff.takeupDuration, eps);
+        takeupU = (t - modeStartTime) / takeupDuration;
+        [takeupBlend, takeupBlendDot, takeupBlendDDot] = ...
+            smoothStep5WithDerivatives(takeupU);
+        positions(:, i) = (1 - takeupBlend) * hoverPosition ...
+            + takeupBlend * takeupPosition;
+        velocities(:, i) = (takeupBlendDot / takeupDuration) ...
+            * (takeupPosition - hoverPosition);
+        accelerations(:, i) = (takeupBlendDDot / takeupDuration^2) ...
+            * (takeupPosition - hoverPosition);
+    elseif strcmp(mode, 'LANDING_RELEASE')
+        positions(:, i) = attach + cfg.takeoff.groundRadialOffset * radial;
+        positions(3, i) = cfg.takeoff.groundZ ...
+            - cfg.takeoff.vehicleGroundClearance;
+    else
+        positions(:, i) = attach + cfg.takeoff.groundRadialOffset * radial;
+        positions(3, i) = cfg.takeoff.groundZ ...
+            - cfg.takeoff.independentHoverHeight;
+    end
+end
+end
+
+function position = vehicleTakeupPosition(attach, radial, cfg)
+targetDistance = cfg.link.length - cfg.takeoff.preTensionSlack;
+horizontalDistance = min(cfg.takeoff.groundRadialOffset, ...
+    0.85 * targetDistance);
+verticalDistance = sqrt(max(targetDistance^2 - horizontalDistance^2, 0));
+position = attach + horizontalDistance * radial;
+position(3) = attach(3) - verticalDistance;
+end
+
+function [distance, slack, qAll, qdAll] = ropeGeometryFromVehicles(state, cfg)
+n = cfg.vehicle.count;
+rhoAll = cfg.payload.attachPoints;
+distance = zeros(1, n);
+slack = zeros(1, n);
+qAll = zeros(3, n);
+qdAll = zeros(3, n);
+for i = 1:n
+    attach = state.loadPosition + state.loadRotation * rhoAll(:, i);
+    attachVelocity = state.loadVelocity + state.loadRotation * ...
+        cross(state.loadBodyRate, rhoAll(:, i));
+    ropeVector = attach - state.vehiclePosition(:, i);
+    distance(i) = norm(ropeVector);
+    slack(i) = cfg.link.length - distance(i);
+    if distance(i) < 1e-9
+        qAll(:, i) = [0; 0; 1];
+        qdAll(:, i) = zeros(3, 1);
+    else
+        qi = ropeVector / distance(i);
+        relativeVelocity = attachVelocity - state.vehicleVelocity(:, i);
+        qdi = (eye(3) - qi * qi.') * relativeVelocity / distance(i);
+        qAll(:, i) = qi;
+        qdAll(:, i) = qdi;
+    end
+end
+end
+
+function radial = horizontalRadial(rho, index, count)
+radial = [rho(1); rho(2); 0];
+if norm(radial) < 1e-9
+    angle = 2 * pi * (index - 1) / max(count, 1);
+    radial = [cos(angle); sin(angle); 0];
+else
+    radial = radial / norm(radial);
+end
+end
+
+function code = modeCode(mode)
+switch mode
+    case 'SLACK'
+        code = 0;
+    case 'TAKEUP'
+        code = 1;
+    case 'TAUT_RAMP'
+        code = 2;
+    case 'ACTIVE'
+        code = 3;
+    case 'LANDING_TAUT'
+        code = 4;
+    case 'LANDING_RELEASE'
+        code = 5;
+    otherwise
+        code = -1;
+end
+end
+
+function value = smoothStep5(value)
+value = min(max(value, 0), 1);
+value = value.^3 .* (10 - 15 * value + 6 * value.^2);
+end
+
+function [value, firstDerivative, secondDerivative] = ...
+    smoothStep5WithDerivatives(value)
+% 五次 smoothstep 及其对无量纲参数的前两阶导数。
+value = min(max(value, 0), 1);
+firstDerivative = 30 * value.^2 .* (1 - value).^2;
+secondDerivative = 60 * value .* (1 - value) .* (1 - 2 * value);
+value = value.^3 .* (10 - 15 * value + 6 * value.^2);
+end
+
+function halfHeight = payloadGroundHalfHeight(R, sizeXYZ)
+% 当前姿态下长方体沿惯性 z 轴的竖直半包络高度。
+sizeXYZ = sizeXYZ(:);
+halfHeight = 0.5 * sum(abs(R(3, :)).' .* sizeXYZ);
 end
 
 % ======================================================================
