@@ -184,6 +184,52 @@ link.initialOutwardOffset     = link.initialOutwardOffset     * scale;
 > 该缩放是**线性启发式**（缺口 50% 就给 50% 的力），力与间距并非线性关系；
 > 真正判据仍以 `summary.vehicleSeparationMargin`（实测最小中心距减要求值）为准。
 
+### 负载放大后的自适应保护（2026-09-28 新增）
+
+负载尺寸放大后，会出现几个**与尺寸强相关**的失稳源。`parameters.m` 在尺寸派生阶段
+自动加了三道保护。它们的共同出发点是同一个事实：
+**姿态力矩只能靠缆绳交付，而可用张力 `m0*g/n` 不随尺寸变。**
+
+#### ① 姿态力矩的『张力预算上限』
+
+`kR = J0 .* wn^2` 让期望力矩正比于 `J0`（尺寸的平方），而交付它靠各绳差分张力
+`delta_mu ≈ Md/(n*rho)`。于是 `delta_mu/可用张力` **正比于尺寸**：
+
+| 尺寸倍数 k | 1.0 | 2.0 | 2.5 | 3.0 | 4.0 |
+|---|---|---|---|---|---|
+| `delta_mu / 可用张力` | 14.7% | 29.5% | 36.8% | 44.2% | 58.9% |
+
+⇒ 负载一大就把张力预算吃光 ⇒ 绳趋松弛、绳向环追不上 ⇒ 发散。
+
+```matlab
+momentCap = cfg.loadController.attitudeMomentBudget ...   % 默认 0.35
+    * cfg.payload.mass * cfg.vehicle.gravity * rhoTyp;
+cfg.loadController.kRCap = momentCap / cfg.loadController.attitudeMomentRefError;  % 0.10 rad
+cfg.loadController.kR = min(cfg.loadController.kR, cfg.loadController.kRCap);
+cfg.loadController.kOmega = 2 * zetaLoad .* sqrt(cfg.loadController.kR .* diag(cfg.payload.inertia));
+```
+
+保持阻尼比不变，只把增益削到预算内。**默认尺寸不触发**（`kR_x = 0.0238 < 0.0567`）；
+用户显式给出 `kR / kOmega` 时不削。派生量：`attitudeMomentCap`、`kRCap`、
+`attitudeGainCapped`（是否被削）、`payload.horizontalArm`（即 `rhoTyp`）。
+
+#### ② 空中外张的『最小倾角地板』
+
+`initialOutwardOffset` 原本只与机体参数有关（**尺寸的 0 次方**，等于 0.1195 m），
+而力臂正比于尺寸 ⇒ 大负载时缆绳相对更竖直、水平张力可用量下降。加地板：
+
+```matlab
+cfg.link.initialOutwardOffset = max(cfg.link.initialOutwardOffset, ...
+    cfg.link.minInFlightTiltRatio * rhoTyp);   % minInFlightTiltRatio 默认 0.20
+```
+
+#### ③ 增益尺寸防火墙
+
+`kR / kOmega / kx / kv / ki` 必须都是 **3x1 列向量**，否则在参数阶段直接报错并
+打印各量的实际尺寸。**教训**：曾把 `kOmega` 写成 `sqrt(...).'` 得到 1x3，
+后续 `kOmega .* eOmega0` 因广播变成 3x3，错报在控制器第 125 行
+`rhs6 = [R0.'*Fd; Md]`（vertcat 维度不一致）—— **报错点离病根很远，必须靠这道检查兜住**。
+
 `initialOutwardOffset` 只用于生成初始绳向；运行过程中缆绳方向由绳向动力学和绳向控制器决定。`TAUT_RAMP` 和 `TAUT_ACTIVE` 阶段缆绳长度约束保持：
 
 $$
@@ -256,6 +302,9 @@ cfg.takeoff.groundRadialOffset % 地面阶段相对负载中心的安全外张�
 | `allocation.payloadNaturalSeparation` | 挂点最小两两间距（派生值）|
 | `vehicle.collisionRadius` | 无人机碰撞包络半径 |
 | `link.vehicleClearance` | 碰撞诊断安全间隙 |
+| `loadController.attitudeMomentBudget` | 姿态力矩占张力预算的比例（默认 0.35）|
+| `loadController.attitudeMomentRefError` | 折算力矩上限用的参考姿态误差（默认 0.10 rad）|
+| `link.minInFlightTiltRatio` | 空中绳向最小倾角比例（默认 0.20）|
 | `takeoff.*` | 地面接触、独立起飞/降落、绳索收紧和软张力过渡参数 |
 
 ## 代码约定

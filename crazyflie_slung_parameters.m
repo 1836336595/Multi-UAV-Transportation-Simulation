@@ -46,7 +46,7 @@ cfg.simulation = struct(...
 % 悬挂一块长方体平台。n 架四旋翼分别挂在平台上三个不共线的挂点上。
 cfg.payload = struct();
 cfg.payload.mass = 0.080;                          % m0，负载质量 [kg]
-cfg.payload.size = [0.08; 0.06; 0.050];            % [长; 宽; 厚] 长方体外形 [m]
+cfg.payload.size = [0.20; 0.20; 0.20];            % [长; 宽; 厚] 长方体外形 [m]
 % 几何派生量在 mergeStruct 后按 size 重新计算。mass 默认独立于尺寸；
 % 若要模拟同材料物品随体积变重，可在 userCfg.payload 中显式提供 density，
 % 并省略 mass，此时质量按 density * volume 自动计算。
@@ -130,7 +130,8 @@ cfg.link = struct(...
     'count', 3, ...                                 % 与 cfg.vehicle.count 保持一致
     'allowTiltedCables', true, ...                 % 允许 q_i 不平行于 e3
     'initialOutwardOffset', NaN, ...                % 初始无人机相对挂点的外张距离 [m]
-    'vehicleClearance', 0.05);                     % 机体中心额外安全间隙 [m]
+    'vehicleClearance', 0.05, ...                    % 机体中心额外安全间隙 [m]
+    'minInFlightTiltRatio', 0.20);                 % 空中绳向最小倾角比例（相对绳长）
 
 % --------------------------------------------------------- 起飞/降落混合阶段
 % 这组参数只控制仿真中的地面接触、松弛绳和绷紧过渡，不改变 Lee 的绷紧段
@@ -260,6 +261,17 @@ cfg.loadController = struct(...
 cfg.loadController.designBandwidthHz = wnLoad / (2 * pi);
 cfg.loadController.yawChannelEnabled = true;
 cfg.loadController.designDampingRatio = zetaLoad;
+
+% 姿态力矩『张力预算』上限（2026-09-28 新增）
+%   病根：kR = J0*wn^2 使期望力矩 Md 正比于 J0（尺寸的平方）；
+%   而把它交付到负载上靠各绳的差分张力 delta_mu ≈ Md/(n*rho)。
+%   可用张力是 m0*g/n（常数）⇒ delta_mu/可用 正比于尺寸。
+%   实测（mass 固定、尺寸放大 k 倍）：k=1 → 14.7%、k=2 → 29.5%、
+%   k=2.5 → 36.8%、k=4 → 58.9% ⇒ 越大越接近吃光张力预算
+%   ⇒ 绳趋松弛、绳向环追不上 ⇒ 发散。这是改尺寸后不稳的主因。
+%   修法：由张力预算反推 kR 上限，大负载自动降带宽换可行性。
+cfg.loadController.attitudeMomentBudget = 0.35;   % 允许力矩占 m0*g*rhoTyp 的比例
+cfg.loadController.attitudeMomentRefError = 0.10; % 折算用参考姿态误差 [rad]
 
 % --------------------------------------------- 张力分配（论文 (13)(22)-(25)）
 % 需要的合力/力矩 [Fd; Md] 通过分配矩阵 P 的伪逆分配到 n 根绳索的张力上：
@@ -685,6 +697,14 @@ if size(cfg.payload.attachPoints, 1) ~= 3
         'cfg.payload.attachPoints 必须是 3 x n 矩阵。');
 end
 
+% 典型水平力臂 rhoTyp：姿态力矩靠差分张力交付，力臂就是挂点水平投影的最大值。
+%   下面两处共用（空中外张的最小倾角地板、姿态增益的力矩预算上限）。
+rhoTyp = 0;
+for i = 1:size(cfg.payload.attachPoints, 2)
+    rhoTyp = max(rhoTyp, norm(cfg.payload.attachPoints(1:2, i)));
+end
+cfg.payload.horizontalArm = rhoTyp;
+
 % 若用户没有手动指定惯量阻尼，则根据尺寸更新负载的派生物理系数。
 if ~isfield(cfg.payload, 'rotationalDampingReferenceSize')
     cfg.payload.rotationalDampingReferenceSize = [0.08; 0.06; 0.050];
@@ -711,12 +731,60 @@ if ~userHasKOmega
     cfg.loadController.kOmega = 2 * zetaLoad .* wnLoad .* diag(cfg.payload.inertia);
 end
 
+% ======================================================================
+% 姿态力矩的『张力预算上限』（2026-09-28 新增）
+%   由张力预算反推 kR 上限；超出就削到上限，并按阻尼比重算 kOmega。
+%   用户显式给出 kR/kOmega 时不削；小负载不触发
+%   （默认尺寸下 kRx = 0.0238 < 上限 0.0567）。
+% ======================================================================
+momentCap = cfg.loadController.attitudeMomentBudget ...
+    * cfg.payload.mass * cfg.vehicle.gravity * rhoTyp;
+cfg.loadController.attitudeMomentCap = momentCap;
+cfg.loadController.kRCap = momentCap / cfg.loadController.attitudeMomentRefError;
+if ~(userHasKR || userHasKOmega) && any(cfg.loadController.kR > cfg.loadController.kRCap)
+    cfg.loadController.kR = min(cfg.loadController.kR, cfg.loadController.kRCap);
+    % 保持阻尼比 zeta：kOmega = 2*zeta*sqrt(kR*J0)
+    cfg.loadController.kOmega = 2 * zetaLoad ...
+        .* sqrt(cfg.loadController.kR .* diag(cfg.payload.inertia));
+    cfg.loadController.attitudeGainCapped = true;
+else
+    cfg.loadController.attitudeGainCapped = false;
+end
+
+% 尺寸防火墙：kR/kOmega/kx/kv/ki 必须都是 3x1 列向量。
+%   教训（2026-09-28）：曾把 kOmega 写成 sqrt(...).' 得到 1x3，
+%   后续 kOmega .* eOmega0 因广播变 3x3 ⇒ 控制器第 125 行
+%   rhs6 = [R0.'*Fd; Md] 报『要串联的数组的维度不一致』。
+%   该分支只在姿态力矩上限触发时执行，小尺寸不暴露 ⇒ 极难发现。
+%   这里显式挡住，让错误在参数阶段就暴露。
+gainOK = isequal(size(cfg.loadController.kR), [3, 1]) ...
+    && isequal(size(cfg.loadController.kOmega), [3, 1]) ...
+    && isequal(size(cfg.loadController.kx), [3, 1]) ...
+    && isequal(size(cfg.loadController.kv), [3, 1]) ...
+    && isequal(size(cfg.loadController.ki), [3, 1]);
+if ~gainOK
+    error('crazyflie_slung_parameters:BadGainShape', ...
+        ['cfg.loadController 的 kR/kOmega/kx/kv/ki 必须都是 3x1 列向量。' ...
+         '当前 kR=%dx%d, kOmega=%dx%d, kx=%dx%d, kv=%dx%d, ki=%dx%d。'], ...
+        size(cfg.loadController.kR, 1), size(cfg.loadController.kR, 2), ...
+        size(cfg.loadController.kOmega, 1), size(cfg.loadController.kOmega, 2), ...
+        size(cfg.loadController.kx, 1), size(cfg.loadController.kx, 2), ...
+        size(cfg.loadController.kv, 1), size(cfg.loadController.kv, 2), ...
+        size(cfg.loadController.ki, 1), size(cfg.loadController.ki, 2));
+end
+
 % 允许无人机在挂点外侧悬挂，而不是强制位于挂点正上方。
 if isempty(cfg.link.initialOutwardOffset) || ~isscalar(cfg.link.initialOutwardOffset) ...
         || ~isfinite(cfg.link.initialOutwardOffset)
     cfg.link.initialOutwardOffset = cfg.vehicle.armLength ...
         + cfg.vehicle.rotorRadius + cfg.link.vehicleClearance;
 end
+% 空中外张 = max(机体包络+间隙, 最小倾角比例 * 最大水平力臂)。
+%   原值只与机体有关（尺寸的 0 次方），而力臂正比于尺寸
+%   ⇒ 大负载时缆绳相对更竖直、水平张力可用量下降。
+%   加最小倾角地板，保证大负载也有同样的倾角比例。
+cfg.link.initialOutwardOffset = max(cfg.link.initialOutwardOffset, ...
+    cfg.link.minInFlightTiltRatio * rhoTyp);
 cfg.link.initialOutwardOffset = min(max(cfg.link.initialOutwardOffset, 0), ...
     0.85 * cfg.link.length);
 if ~isfield(cfg.vehicle, 'collisionRadius') || isempty(cfg.vehicle.collisionRadius)
