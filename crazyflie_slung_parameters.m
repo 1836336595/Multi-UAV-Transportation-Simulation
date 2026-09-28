@@ -46,7 +46,7 @@ cfg.simulation = struct(...
 % 悬挂一块长方体平台。n 架四旋翼分别挂在平台上三个不共线的挂点上。
 cfg.payload = struct();
 cfg.payload.mass = 0.080;                          % m0，负载质量 [kg]
-cfg.payload.size = [0.20; 0.20; 0.20];            % [长; 宽; 厚] 长方体外形 [m]
+cfg.payload.size = [0.08; 0.06; 0.05];            % [长; 宽; 厚] 长方体外形 [m]
 % 几何派生量在 mergeStruct 后按 size 重新计算。mass 默认独立于尺寸；
 % 若要模拟同材料物品随体积变重，可在 userCfg.payload 中显式提供 density，
 % 并省略 mass，此时质量按 density * volume 自动计算。
@@ -212,6 +212,8 @@ zetaLoad = 0.90;                        % 目标阻尼比
 kRLoad = diag(payloadInertia) .* wnLoad.^2;
 kOmegaLoad = 2 * zetaLoad * wnLoad .* diag(payloadInertia);
 
+% ★ 手动指定负载姿态增益（留空 [] = 用下面的自动计算；
+%   放在 struct 外面是为了不打断续行，也便于静态检查识别字段）
 cfg.loadController = struct(...
     'kx', [3.0; 3.0; 3.75], ...       % 定高增益（omega_n ≈ 1.73~1.94 rad/s）
     'kv', [3.12; 3.12; 3.12], ...     % 定高增益（zeta ≈ 0.90）
@@ -220,7 +222,9 @@ cfg.loadController = struct(...
     'kOmega', kOmegaLoad, ...         % 负载角速度增益 [N*m*s/rad] = 2 zeta wn J0
     'c1', 0.50, ...                   % 积分器交叉项系数（抑制饱和下的过冲）
     'integralLimit', [0.50; 0.50; 0.50], ...   % 积分饱和限幅
-    'forceNormEpsilon', 1e-9);        % ||Fd|| 数值保护阈值
+    'forceNormEpsilon', 1e-9, ...      % ||Fd|| 数值保护阈值
+    'manualKR', [], ...               % 手动 kR     [N*m/rad]  空=自动
+    'manualKOmega', []);              % 手动 kOmega [N*m*s/rad] 空=自动
 % ★★★ 位置增益是**绕八字工况专用**的重标定值，与静态悬停工况不同 ★★★
 %   静态悬停时用 [3.0; 3.0; 3.75] 就够（误差收敛到 3.63 mm）。
 %   但绕八字时参考点在持续运动，位置环必须"追得上"，否则留下
@@ -724,10 +728,17 @@ userHasKR = userHasLoadController && isfield(userCfg.loadController, 'kR');
 userHasKOmega = userHasLoadController && isfield(userCfg.loadController, 'kOmega');
 wnLoad = 2 * pi * cfg.loadController.designBandwidthHz(:);
 zetaLoad = cfg.loadController.designDampingRatio;
-if ~userHasKR
-    cfg.loadController.kR = diag(cfg.payload.inertia) .* wnLoad.^2;
-end
-if ~userHasKOmega
+manualKR     = cfg.loadController.manualKR;
+manualKOmega = cfg.loadController.manualKOmega;
+cfg.loadController.attitudeGainManual = ~isempty(manualKR) || ~isempty(manualKOmega) ...
+    || userHasKR || userHasKOmega;
+if cfg.loadController.attitudeGainManual
+    % 手动/用户指定：原样采用，不做自动计算
+    if ~isempty(manualKR),     cfg.loadController.kR     = manualKR(:);     end
+    if ~isempty(manualKOmega), cfg.loadController.kOmega = manualKOmega(:); end
+else
+    % 自动：按最终 J0 与目标带宽反解
+    cfg.loadController.kR     = diag(cfg.payload.inertia) .* wnLoad.^2;
     cfg.loadController.kOmega = 2 * zetaLoad .* wnLoad .* diag(cfg.payload.inertia);
 end
 
@@ -741,7 +752,7 @@ momentCap = cfg.loadController.attitudeMomentBudget ...
     * cfg.payload.mass * cfg.vehicle.gravity * rhoTyp;
 cfg.loadController.attitudeMomentCap = momentCap;
 cfg.loadController.kRCap = momentCap / cfg.loadController.attitudeMomentRefError;
-if ~(userHasKR || userHasKOmega) && any(cfg.loadController.kR > cfg.loadController.kRCap)
+if ~cfg.loadController.attitudeGainManual && any(cfg.loadController.kR > cfg.loadController.kRCap)
     cfg.loadController.kR = min(cfg.loadController.kR, cfg.loadController.kRCap);
     % 保持阻尼比 zeta：kOmega = 2*zeta*sqrt(kR*J0)
     cfg.loadController.kOmega = 2 * zetaLoad ...

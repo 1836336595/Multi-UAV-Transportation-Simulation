@@ -124,6 +124,40 @@ kOmegaLoad = 2*zetaLoad*wnLoad .* diag(payloadInertia);
 
 负载 yaw 与无人机自身 yaw 是不同通道。`attitudeController.headingSource` 只决定无人机绕推力轴的机体航向参考，不会关闭负载 yaw 环。
 
+### 负载姿态增益的三种设定方式
+
+`cfg.loadController.kR / kOmega`（负载的 roll/pitch/yaw 三个轴各一个值）**默认是算出来的**，
+不是手填的。来源是「目标带宽 + 阻尼比 + 负载惯量」：
+
+```matlab
+wnLoad   = 2*pi*[6.0; 6.0; 0.45];   % 目标带宽：roll/pitch 6 Hz，yaw 0.45 Hz
+zetaLoad = 0.90;                    % 目标阻尼比
+kR       = diag(J0) .* wnLoad.^2;   % 反解：omega_n = sqrt(kR/J0)
+kOmega   = 2*zetaLoad*wnLoad .* diag(J0);
+```
+
+**为什么用这个写法**：`J0` 会被约掉 ⇒ 闭环带宽正好等于你指定的 `wnLoad`，
+与负载多重多大无关。若把增益写死成常数，改尺寸后带宽会跟着漂
+（历史教训：`kR=0.55` 配 `J0=2.69e-4` 时，`kOmega/J0` 达 1300 rad/s ≈ 207 Hz，
+逼近 500 Hz 采样的奈奎斯特边界 ⇒ 姿态环数值发散）。
+
+设定优先级（从高到低）：
+
+| # | 方式 | 是否受张力预算上限削减 |
+|---|---|---|
+| 1 | `userCfg.loadController.kR / kOmega` | **不受** |
+| 2 | `cfg.loadController.manualKR / manualKOmega` | **不受** |
+| 3 | 自动（`designBandwidthHz` + `designDampingRatio` + 最终 `J0`）| 受 |
+
+手动用法：
+
+```matlab
+cfg.loadController.manualKR     = [0.39; 0.39; 0.0043];
+cfg.loadController.manualKOmega = [0.0189; 0.0189; 0.0027];
+```
+
+查 `cfg.loadController.attitudeGainManual` 可知当前是否用的是手动值。
+
 ## 倾斜缆绳与碰撞避免
 
 默认配置：
@@ -303,6 +337,8 @@ cfg.takeoff.groundRadialOffset % 地面阶段相对负载中心的安全外张�
 | `vehicle.collisionRadius` | 无人机碰撞包络半径 |
 | `link.vehicleClearance` | 碰撞诊断安全间隙 |
 | `loadController.attitudeMomentBudget` | 姿态力矩占张力预算的比例（默认 0.35）|
+| `loadController.manualKR` | **手动指定负载姿态增益** `kR`（留空 `[]` = 自动）|
+| `loadController.manualKOmega` | **手动指定负载角速度增益** `kOmega`（留空 `[]` = 自动）|
 | `loadController.attitudeMomentRefError` | 折算力矩上限用的参考姿态误差（默认 0.10 rad）|
 | `link.minInFlightTiltRatio` | 空中绳向最小倾角比例（默认 0.20）|
 | `takeoff.*` | 地面接触、独立起飞/降落、绳索收紧和软张力过渡参数 |
