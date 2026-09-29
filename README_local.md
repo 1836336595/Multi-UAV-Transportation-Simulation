@@ -1,4 +1,23 @@
-# Geometric Control of Cable-Suspended Rigid Body
+# 带公式版 README（LaTeX）
+
+> **这份是"带公式"的版本**，保留了 LaTeX 数学块（用成对的美元符号定界）。
+> 请用**支持数学公式的 Markdown 编辑器**打开：Typora、VS Code
+> （+ Markdown Preview Enhanced / Markdown All in One）、Obsidian、Zettlr 都可以。
+>
+> ★ **在 GitHub 网页上直接看这一份，公式会显示成美元符号原文** —— 这是预期的，
+> 因为这里依赖的数学渲染在网页端不一定生效。**想看能正常显示的版本请用 `README.md`**
+> （它也默认作为仓库首页展示）。
+>
+> | 文件 | 公式写法 | 适用场景 |
+> |---|---|---|
+> | `README.md` | 纯文本 / Unicode | **GitHub 网页**、Gitee、终端、任意编辑器（仓库默认展示）|
+> | `README_local.md`（本文件）| LaTeX | 本地用 Typora / VS Code / Obsidian 阅读 |
+>
+> 两份正文内容一致，只有公式写法不同；**改内容时两份都要改**。
+
+---
+
+## Geometric Control of Cable-Suspended Rigid Body
 
 三架 Crazyflie 2.1 Brushless 协同吊运刚体负载的 MATLAB 仿真工程。模型和控制器对应 Lee 2014/2018 的几何控制框架，并保留 Crazyflie 推力执行器和角速度内环等效模型。
 
@@ -10,11 +29,6 @@
 4. 小尺寸负载时通过张力分配零空间的外张内部力降低无人机碰撞风险，并按碰撞缺口自适应；
 5. 加入"松弛绳起飞 → 收紧 → 软绷紧 → 协同运输 → 独立降落"的混合流程，
    并对交接瞬态做了逐项定量处理（见《地面起飞、绳索收紧与独立降落》）。
-
-> **关于文档**：本仓库有两份 README。**本文件**的公式全部写成纯文本 / Unicode，
-> 在 GitHub 网页、Gitee、终端、任意编辑器里都能正常显示；`README_local.md` 保留了
-> LaTeX 公式，适合本地用 Typora / VS Code / Obsidian 阅读（在 GitHub 网页上它的公式
-> 会显示成美元符号原文）。两份正文一致，只有公式写法不同。
 
 ## 运行环境
 
@@ -47,7 +61,6 @@ report = crazyflie_slung_demo();         % 完整仿真、自检和可视化
 | `crazyflie_slung_visualization.m` | 轨迹、负载、无人机和缆绳可视化 |
 | `crazyflie_slung_diagnose.m` | 发散起点和数值异常定位 |
 | `dump_sim_data.m` | （可选调试工具）跑一次仿真并把关键日志导出成 CSV + 诊断报告，便于用数据而非看图排查；不参与仿真，可直接删除 |
-| `README_local.md` | 本 README 的**带公式版**（保留 LaTeX）。用 Typora / VS Code / Obsidian 本地阅读时看它；**在 GitHub 网页上它的公式会显示成美元符号原文**，网页阅读请用本文件 |
 | `.gitignore` | 忽略 MATLAB 自动保存文件等（`*.asv` 等） |
 | `ENGINEERING_LOG.md` | 公式、修改原因和调参记录 |
 
@@ -64,21 +77,25 @@ cfg = crazyflie_slung_parameters(userCfg);
 sim = crazyflie_slung_simulation(cfg);
 ```
 
-`payload.size = [a; b; c]` 的含义是长、宽、高。默认挂点模板为（负载体系，z 轴向下为正）：
+`payload.size = [a; b; c]` 的含义是长、宽、高。默认挂点模板为：
 
-```text
-ρ1 = (  a/2,    0 ,  -c/2 )        a = 长, b = 宽, c = 高
-ρ2 = ( -a/2,   b/2,  -c/2 )        即：一边中点 + 对边两个顶点
-ρ3 = ( -a/2,  -b/2,  -c/2 )        三者都在上表面 (z = -c/2)
-```
+$$
+\rho_1=(a/2,0,-c/2),\quad
+\rho_2=(-a/2,b/2,-c/2),\quad
+\rho_3=(-a/2,-b/2,-c/2).
+$$
 
 实际代码通过无量纲 `payload.attachFractions` 乘以 `payload.size` 生成挂点，因此修改尺寸后挂点仍位于负载上表面边界。若显式提供 `userCfg.payload.attachPoints`，该自定义值优先，但必须为 `3 x n` 且列数等于无人机数量。
 
 均质长方体惯量自动计算为：
 
-```text
-J0 = diag( m0·(b² + c²)/12 ,  m0·(a² + c²)/12 ,  m0·(a² + b²)/12 )
-```
+$$
+J_0=\operatorname{diag}\left(
+\frac{m_0(b^2+c^2)}{12},
+\frac{m_0(a^2+c^2)}{12},
+\frac{m_0(a^2+b^2)}{12}
+\right).
+$$
 
 同时自动更新 `payload.inertia`、体积、表面积、外接半径、转动阻尼、`loadController.kR`、`loadController.kOmega`、当前挂点几何对应的悬停张力和初始推力。
 
@@ -100,19 +117,16 @@ cfg = crazyflie_slung_parameters(userCfg);
 cfg.loadController.yawChannelEnabled = true;
 ```
 
-控制器先计算负载 SO(3) 姿态误差和期望力矩 `Md`，再通过下面的分配矩阵把合力和合力矩分配到各根缆绳：
+控制器先计算负载 SO(3) 姿态误差和期望力矩 `Md`，再通过分配矩阵
 
-```text
-        [   I        I        I      ]      <- 前 3 行
-P  =    [                              ]          P 是 6 x 3n
-        [  hat(ρ1) hat(ρ2) hat(ρ3)   ]      <- 后 3 行
+$$
+P=\begin{bmatrix}
+I&I&I\\
+\widehat\rho_1&\widehat\rho_2&\widehat\rho_3
+\end{bmatrix}
+$$
 
-  I        = 3x3 单位阵
-  hat(ρ)   = 由 ρ 生成的 3x3 反对称阵
-```
-
-只要挂点不共线且缆绳有足够倾角，yaw 力矩就可以通过水平张力分量传递。
-yaw 使用较低带宽，是为了避免直接激励绳索摆动，不代表关闭 yaw 控制。
+把合力和合力矩分配到各根缆绳。只要挂点不共线且缆绳有足够倾角，yaw 力矩就可以通过水平张力分量传递。yaw 使用较低带宽，是为了避免直接激励绳索摆动，不代表关闭 yaw 控制。
 
 实际带宽（`parameters.m`）：
 
@@ -178,9 +192,9 @@ cfg.link.allowTiltedCables = true;
 
 控制器在满足负载合力和合力矩的最小范数张力解上加入零空间内部力：
 
-```text
-P · μ_internal = 0
-```
+$$
+P\mu_{\mathrm{internal}}=0.
+$$
 
 因此它不会改变负载的期望合力和合力矩，只会改变各根缆绳的空间分布，使无人机从挂点正上方适度向外侧分开。外张强度由以下参数控制：
 
@@ -278,9 +292,9 @@ cfg.link.initialOutwardOffset = max(cfg.link.initialOutwardOffset, ...
 
 `initialOutwardOffset` 只用于生成初始绳向；运行过程中缆绳方向由绳向动力学和绳向控制器决定。绷紧阶段（`TAUT_RAMP` / `ACTIVE`）缆绳长度约束保持：
 
-```text
-x_i = x_0 + R_0·ρ_i − l_i·q_i ,      ‖q_i‖ = 1
-```
+$$
+x_i=x_0+R_0\rho_i-l_iq_i,\qquad \|q_i\|=1.
+$$
 
 自检不再要求 `q_i = e_3` 或无人机水平投影必须在负载上方，而是检查绳长、张力正性、无人机间距、无人机与负载外接包络间隙，以及垂直净空诊断。
 
