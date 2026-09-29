@@ -2,13 +2,14 @@
 
 三架 Crazyflie 2.1 Brushless 协同吊运刚体负载的 MATLAB 仿真工程。模型和控制器对应 Lee 2014/2018 的几何控制框架，并保留 Crazyflie 推力执行器和角速度内环等效模型。
 
-本版本重点处理四个问题：
+本版本重点处理五个问题：
 
-1. 负载尺寸、挂点、惯量和相关控制参数保持一致；
-2. 负载 yaw 使用开启的低带宽闭环，而不是关闭 yaw 反馈；
+1. 负载尺寸、挂点、惯量和相关控制参数保持一致（改 `payload.size` 后会自动重建派生量）；
+2. 负载 yaw 使用**开启的低带宽闭环**，而不是关闭 yaw 反馈；
 3. 缆绳允许倾斜，无人机不被强制放在负载正上方；
-4. 小尺寸负载时通过张力分配零空间的外张内部力降低无人机碰撞风险。
-5. 仿真加入“松弛绳起飞—收紧—软绷紧—协同运输—独立降落”的混合流程。
+4. 小尺寸负载时通过张力分配零空间的外张内部力降低无人机碰撞风险，并按碰撞缺口自适应；
+5. 加入"松弛绳起飞 → 收紧 → 软绷紧 → 协同运输 → 独立降落"的混合流程，
+   并对交接瞬态做了逐项定量处理（见《地面起飞、绳索收紧与独立降落》）。
 
 ## 运行环境
 
@@ -19,7 +20,8 @@
 ## 快速运行
 
 ```matlab
-cd('F:/workbuddy_doc/transporting/git')
+% 先把本目录加入路径（换成你自己的路径）
+addpath(pwd);
 report = crazyflie_slung_demo('quick');  % 快速自检，不绘图
 report = crazyflie_slung_demo();         % 完整仿真、自检和可视化
 ```
@@ -39,6 +41,8 @@ report = crazyflie_slung_demo();         % 完整仿真、自检和可视化
 | `crazyflie_slung_demo.m` | 一键仿真和自检报告 |
 | `crazyflie_slung_visualization.m` | 轨迹、负载、无人机和缆绳可视化 |
 | `crazyflie_slung_diagnose.m` | 发散起点和数值异常定位 |
+| `dump_sim_data.m` | （可选调试工具）跑一次仿真并把关键日志导出成 CSV + 诊断报告，便于用数据而非看图排查；不参与仿真，可直接删除 |
+| `.gitignore` | 忽略 MATLAB 自动保存文件等（`*.asv` 等） |
 | `ENGINEERING_LOG.md` | 公式、修改原因和调参记录 |
 
 ## 修改负载尺寸
@@ -138,8 +142,9 @@ kOmega   = 2*zetaLoad*wnLoad .* diag(J0);
 
 **为什么用这个写法**：`J0` 会被约掉 ⇒ 闭环带宽正好等于你指定的 `wnLoad`，
 与负载多重多大无关。若把增益写死成常数，改尺寸后带宽会跟着漂
-（历史教训：`kR=0.55` 配 `J0=2.69e-4` 时，`kOmega/J0` 达 1300 rad/s ≈ 207 Hz，
-逼近 500 Hz 采样的奈奎斯特边界 ⇒ 姿态环数值发散）。
+（`omega_n = sqrt(kR/J0)` 直接随 `J0` 变）；更危险的是**阻尼比**——手填的 `kOmega`
+与 `J0` 不匹配时，速率环等效极点 `kOmega/J0` 可能远高于环路采样频率
+（`1/dt = 500 Hz`），姿态环会数值发散。
 
 设定优先级（从高到低）：
 
@@ -200,7 +205,7 @@ link.initialOutwardOffset     = link.initialOutwardOffset     * scale;
 `allocation.payloadNaturalSeparation`、`allocation.outwardBiasScale`。
 **用户若显式提供 `outwardBiasFraction` 或 `initialOutwardOffset`，则尊重用户值、不再缩放。**
 
-以当前默认参数（`payload.size = [0.08;0.06;0.05]`、`mass = 0.033 kg`）为例：
+以当前默认参数（`payload.size = [0.08;0.06;0.05]`、`mass = 0.080 kg`）为例：
 
 | 量 | 值 |
 |---|---|
@@ -209,7 +214,7 @@ link.initialOutwardOffset     = link.initialOutwardOffset     * scale;
 | `payloadNaturalSeparation` | 挂点 2 与挂点 3 距离 = **0.0600 m**（等于宽 b）|
 | `outwardBiasScale` | **0.6825** |
 | `outwardBiasFraction` | 0.20 缩小到 **0.1365** |
-| 每机外张力 | 0.0368 N 缩小到 **0.0251 N** |
+| 每机外张力（偏置 RMS）| 0.0906 N 缩小到 **0.0619 N** |
 | `initialOutwardOffset` | 0.1195 m 缩小到 **0.0816 m** |
 
 而负载大到 `natSep >= reqSep`（本方参数集约 0.19 m）时 `scale` 归零，
@@ -243,9 +248,11 @@ cfg.loadController.kR = min(cfg.loadController.kR, cfg.loadController.kRCap);
 cfg.loadController.kOmega = 2 * zetaLoad .* sqrt(cfg.loadController.kR .* diag(cfg.payload.inertia));
 ```
 
-保持阻尼比不变，只把增益削到预算内。**默认尺寸不触发**（`kR_x = 0.0238 < 0.0567`）；
+保持阻尼比不变，只把增益削到预算内。**默认尺寸不触发**
+（`kR_x = 0.0578 < kRCap = 0.35·m0·g·rhoTyp/0.10 = 0.137`，其中 `rhoTyp = 0.05 m`）；
 用户显式给出 `kR / kOmega` 时不削。派生量：`attitudeMomentCap`、`kRCap`、
-`attitudeGainCapped`（是否被削）、`payload.horizontalArm`（即 `rhoTyp`）。
+`attitudeGainCapped`（是否被削）、`payload.horizontalArm`（即 `rhoTyp`，
+取各挂点水平投影的最大值 = 0.05 m）。
 
 #### ② 空中外张的『最小倾角地板』
 
@@ -264,7 +271,7 @@ cfg.link.initialOutwardOffset = max(cfg.link.initialOutwardOffset, ...
 后续 `kOmega .* eOmega0` 因广播变成 3x3，错报在控制器第 125 行
 `rhs6 = [R0.'*Fd; Md]`（vertcat 维度不一致）—— **报错点离病根很远，必须靠这道检查兜住**。
 
-`initialOutwardOffset` 只用于生成初始绳向；运行过程中缆绳方向由绳向动力学和绳向控制器决定。`TAUT_RAMP` 和 `TAUT_ACTIVE` 阶段缆绳长度约束保持：
+`initialOutwardOffset` 只用于生成初始绳向；运行过程中缆绳方向由绳向动力学和绳向控制器决定。绷紧阶段（`TAUT_RAMP` / `ACTIVE`）缆绳长度约束保持：
 
 $$
 x_i=x_0+R_0\rho_i-l_iq_i,\qquad \|q_i\|=1.
@@ -278,15 +285,22 @@ $$
 `cfg.takeoff.enabled = true`，状态机为：
 
 ```text
-SLACK -> TAKEUP -> TAUT_RAMP -> TAUT_ACTIVE
-                                      |
-                         LANDING_TAUT -> LANDING_RELEASE
+SLACK -> TAKEUP -> TAUT_RAMP -> ACTIVE
+                                     |
+                       LANDING_TAUT -> LANDING_RELEASE
 ```
 
+> **命名提醒**：状态机里第三段的名字是 `ACTIVE`（见 `crazyflie_slung_simulation.m`
+> 末尾 `modeCode` 的 `case`）。README 早期几版、`ENGINEERING_LOG.md` 和可视化图例
+> 里写作 `TAUT_ACTIVE`，那只是叫法。**代码里 `strcmp(mode, ...)` 必须用 `'ACTIVE'`** ——
+> 写错不会报错，只会让那个分支永远不命中（本项目为此踩过一次，见下）。
+
 - `SLACK`：负载底面接触地面，三架无人机使用独立几何 PID 飞到安全高度；绳索长度由实际无人机位置计算，张力为 0。
-- `TAKEUP`：无人机缓慢接近 `link.length - preTensionSlack`，用挂点距离和持续时间确认所有绳索接近绷直。
-- `TAUT_RAMP`：在 `tensionRampTime` 内平滑建立协同控制输入，同时限制负载穿地。
-- `TAUT_ACTIVE`：进入 Lee 2014/2018 的绷紧缆绳模型和完整负载位置、姿态、yaw 控制。
+- `TAKEUP`：无人机沿**悬停平衡绳向**（`link.takeupLinkUnitsBody`，由控制器求得）缓慢接近
+  "挂点距离 = `link.length - preTensionSlack`"，用挂点距离和持续时间确认所有绳索接近绷直。
+- `TAUT_RAMP`：在 `tensionRampTime` 内平滑建立协同控制输入（参考冻结在交接瞬间的实测状态），
+  同时限制负载穿地。
+- `ACTIVE`：进入 Lee 2014/2018 的绷紧缆绳模型和完整负载位置、姿态、yaw 控制。
 - `LANDING_TAUT`：末段将负载平滑下降到地面；接触后进入 `LANDING_RELEASE`，无人机解除绳索约束并独立降落。
 
 起飞阶段的坐标约定需要特别注意：动力学惯性系采用论文约定的
@@ -305,16 +319,269 @@ q_i = ((x_0 + R_0*rho_i) - x_i) / d_i;
 
 `epsilonOn`/`epsilonOff` 形成迟滞，`confirmTime` 防止噪声触发误切换。`sim.ropeDistanceLog`、`sim.ropeSlackLog`、`sim.takeoffModeLog` 和 `sim.tensionScaleLog` 可用于检查每次切换。绷紧阶段的 `sim.tensionLog` 是模型估计/指令张力，不是传感器实测值；真机应使用动捕/UWB 的无人机与负载位姿，并在有条件时增加绳端拉力传感器。
 
+### 交接参考剖面的设计（2026-09-28 修复，含实测依据）
+
+交接段最容易搞错的是**参考的时序**。三条结论都是用转储数据（而非看曲线）得出的：
+
+**① 张力建立期间负载**必然**贴地，参考不该动。**
+本设计的悬停总张力恰好等于负载重量（`summary.hoverTensionByLink` 合计 = `m0*g`），
+而 `tensionScale` 混合的 `uHover = m*g` 只抵无人机自重（**零张力**）。
+所以 `tensionScale` 从 0 到 1 就是张力从 0 涨到 `m0*g`
+⇒ **只有斜坡末端（`tensionScale ≈ 0.9~1.0`）负载才可能离地**。
+实测：参考 1.5 s 内从 0.028 m 升到 0.350 m，而负载到 6.396 s 仍贴地
+⇒ 位置误差在斜坡末端堆到 **0.3925 m**，之后负载才在 8.7 s 追上。
+⇒ 正确顺序是**两段**：
+
+```text
+张力建立段 rampT（= tensionRampTime）  参考【冻结】在交接瞬间实测状态，误差恒 ≈ 0
+抬升段     liftT（= referenceLiftTime）  参考用 5 次多项式剖面从冻结起点走到目标
+```
+
+**② 三个通道必须同源。**
+`desired.position` 的导数要等于 `desired.velocity`、二阶导要等于
+`desired.acceleration`，全部取自同一个 `smoothStep5WithDerivatives`。
+只把位置做平滑、速度和加速度留 0，等于"参考自己在动、却要求速度为 0"，
+位置环只能靠反馈硬追 ⇒ 负载明显滞后。
+实测（旧写法，降落段同样问题）：参考 2.2 s 内从 0.350 降到 0.028 m，
+负载只降到 0.146 m，**滞后 118 mm**，随后释放段不得不把负载"瞬移"到地面。
+
+**③ 剖面的起点必须冻结。**
+若锚点取当前实测值（`desired = 实测 + s·(目标 − 实测)`），误差只能按比例 `s` 释放；
+负载不动时误差照样涨满 —— 这正是上一版的行为。所以交接瞬间要把
+`tautStartPosition` / `tautStartVelocity` 快照下来（`landingStartPosition` 同理）。
+
+参考剖面：交接后先冻结 `tensionRampTime`，再用 `referenceLiftTime` 走完到目标的位移。
+峰值速度 ≈ `1.875·D/liftT`、峰值加速度 ≈ `5.77·D/liftT²`
+（当前默认 `D ≈ 0.34 m`、`liftT = 3.0 s` ⇒ **0.214 m/s / 0.220 m/s²**；
+旧写法把两者绑在同一个 1.5 s 斜披上时是 0.428 / 0.879）。
+两端速度、加速度均为 0 ⇒ 与前面的地面段、后面的悬停段都 C² 连续。
+用 `dump_sim_data.m` 导出的 `des_x/des_y/des_z` 可以逐点核对这条剖面。
+
+**④ 顺带修掉的一个静默失效**（这类错误不报错，只让分支永不命中）：
+
+```matlab
+% ✗ 状态机里的名字是 'ACTIVE'，不是 'TAUT_ACTIVE' ⇒ 条件恒真
+%   ⇒ 运输全程每一步都把 positionIntegral 清零，ki 完全失效
+if ~(strcmp(mode, 'TAUT_ACTIVE') || strcmp(mode, 'LANDING_TAUT'))
+    memory.positionIntegral = zeros(3, 1);
+end
+```
+
+因为它是"清积分"的分支，失效后**没有任何报错或异常**，只是 `ki` 不再起作用。
+修好之后 `ki` 才真正生效，所以巡航段行为会与之前略有不同，需要重新确认。
+另外，交接抬升窗口内也必须继续清零积分器：那一段是**指令性瞬态**，
+参考由前馈剖面给出，残余误差不是常值扰动；若让积分器累积，
+抬升结束时它会带着"憋住的力"把负载顶过目标（新的过冲来源）。
+
+### 收紧段绳向必须等于**悬停平衡绳向**（2026-09-28 修复）
+
+交接瞬间的绳向误差 `eqi` 一开始就有大小之分，这不是"初始扰动"，而是**几何定义不一致**：
+
+| | 收紧段（旧） | 悬停平衡（控制器期望） |
+|---|---|---|
+| 依据 | `takeoff.groundRadialOffset`（**一个统一值**） | 张力分配 + 零空间外张偏置 |
+| 绳 1 | 16.4° | **10.93°** |
+| 绳 2 | 16.4° | **15.27°** |
+| 绳 3 | 16.4° | **15.27°** |
+
+原因：悬停张力是 **2:1:1**（挂点质心偏离负载质心），受力大的那根绳更竖直
+⇒ 控制器期望的平衡倾角是**三根各不相同**的。而旧写法用一个统一的水平偏移
+把三机放到挂点外侧 ⇒ 三根绳倾角**完全相同**。
+⇒ 交接瞬间 `eqi` 就有 5.6/1.2/1.0°，绳向环要在 0.2 s 内吞掉这个阶跃：
+实测绳向误差冲到 **36°**、负载角速度 2.9 rad/s、机体速率与姿态指令**打到限幅**。
+
+**修法**：收紧段的绳向改由**控制器自己的悬停平衡解**给出
+（`simulation.m` 的 `equilibriumLinkUnitsBody()`：构造一个 `ex=0, ev=0, eR0=0` 的
+`desired` 让控制器算一次分配，取回 `command.desiredLinkUnits`）：
+
+```matlab
+% 无人机 = 挂点 - (linkLength - preTensionSlack) * q_平衡   （q 由无人机指向负载）
+cfg.link.takeupLinkUnitsBody = equilibriumLinkUnitsBody(state, cfg);
+```
+
+于是 **交接瞬间实际绳向 == 期望绳向 ⇒ `eqi ≡ 0`**（这是构造性成立，不是调参），
+而 `q_id` 与 `tensionScale` 无关（`q_id = -mu_id/||mu_id||` 是尺度无关的），
+所以整段 `TAUT_RAMP` 里 `eqi` 都保持 ≈ 0。
+
+★ **顺带纠正一处概念混淆**：`groundRadialOffset` 是**避碰**量
+（`boundingRadius + collisionRadius + vehicleClearance`），把它当**动力学**的绳向用
+本来就不成立 —— 两个需求互不相关。地面段（`SLACK`）照旧用它，
+收紧段改用平衡绳向。为免静默，`simulation.m` 会算一遍收紧段的机-负载最小水平距离：
+低于**碰撞下限** `boundingRadius+collisionRadius` 才 `warning`；
+低于"碰撞下限 + `vehicleClearance`"只打印一行提示（后者是**地面期**的额外余量，
+机在负载上方 0.6 m 时不该再套用）。
+
+### 地面必须给**水平摩擦**（2026-09-29 修复）
+
+交接瞬态里还有一条持续扰动，来自一个纯粹的**建模缺口**：
+
+```text
+负载高度（转储实测）： 5.778 s → 0.0279 m   6.300 s → 0.0279 m
+                       6.500 s → 0.0279 m   6.900 s → 0.0279 m
+负载 x （转储实测）：  5.778 s → 0        6.900 s → −0.179 m
+```
+
+**负载一直贴在触地高度（0.0279 m = `groundZ − 半高`），却在水平方向滑了 0.18 m。**
+原因是地面接触模型原来只有 z 向约束、**没有 xy 向摩擦** —— 等于"躺在无摩擦地面上"。
+绳子的水平不平衡力（实测 ~0.07 N）把它拖走，挂点随之平移，
+又反过来改变绳向、持续激励绳向环：绳向误差冲到 30°、负载角速度 2.7 rad/s、
+速率/姿态指令打到限幅。
+
+但真实情况下静摩擦上限 ≈ `μ·m0·g` = 0.24~0.39 N，是那个扰动的 **3~4 倍**
+⇒ **负载根本不会滑**。所以原来的滑动是模型缺摩擦造出来的假象。
+
+修法（`simulation.m` 地面接触块内）：接触期给库仑摩擦，水平减速度上限 `μ·g`，
+并且 **μ 随法向力衰减** —— 绳把负载往上提 ⇒ 法向力 `N = m0·g − Σ T_i·q_i,z` 减小
+⇒ 摩擦上限减小；张力涨到等于自重时 `N → 0`、摩擦自然消失。
+这样离地瞬间是干净的，不需要额外的"释放判据"。
+
+```matlab
+'groundFrictionMu', 0.50, ...          % 负载触地时的库仑摩擦系数
+'groundContactTolerance', 0.002, ...   % 判定"仍在地面接触"的竖直余量 [m]
+```
+
+### 独立控制器的积分器必须抗饱和（2026-09-29 修复）
+
+同一轮还查出一个"看着小、但让判据变临界"的问题：收紧结束时绳长停在
+**0.6200 m = `l − 0.0300`**，而 `epsilonOn = 0.030` —— **正好卡在绷紧判据的边界上**，
+于是"绳是否绷紧"变成临界判断，TAKEUP 实际持续 3.28 s 而不是 `takeupDuration` 的 2.5 s。
+（修好后实测 2.27 s，已回到 `takeupDuration` 附近。）
+
+根因：`crazyflie_slung_independent_controller.m` 原来**无条件积分**，
+而 SLACK/TAKEUP 是"从 0.3 m 外飞向目标"的大机动 ⇒ 积分器一路灌到限幅附近
+（`Ki = 0.8`、限幅 0.20 ⇒ 最大 0.16 m/s² 的恒定力偏置）⇒ 停下来后无人机被稳稳压在
+目标下方 **18 mm**，绳长也就到不了设计值 `l − preTensionSlack = 0.638`。
+
+修法：加抗饱和 gate —— **位置误差大的时候不积分**：
+
+```matlab
+'independentIntegralGate', 0.050, ...   % 位置误差 < 它才积分 [m]
+```
+
+大机动段积分器不动（不影响跟踪），误差进入 gate 后才积分 ⇒ 稳态余差收干净，
+收紧长度能落到设计值。交接处也顺手把该积分器清零（`TAUT_RAMP` 入口），
+避免降落段重新启用独立控制器时带着起飞段的旧偏置。
+
+### 交接点必须落在"绳刚好拉直"上（`preTensionSlack = 0`，2026-09-29 修复）
+
+第三轮数据里最要命的一条：**模式切换那一拍，三架无人机同时瞬移 17 mm**（等价速率 8.5 m/s）。
+
+```text
+4.878 s（TAKEUP）      d = 0.6325 / 0.6326 / 0.6326   vehZ = −0.6702 / −0.6604 / −0.6684
+4.880 s（TAUT_RAMP）   d = 0.6500 / 0.6500 / 0.6500   vehZ = −0.6873 / −0.6770 / −0.6853
+                       ↑ 一拍（2 ms）内绳长被强制归零，无人机下移 17 mm
+```
+
+根因：**本模型只能表示绷紧的绳**（松弛段未实现）。而 `preTensionSlack = 0.012`
+要求收紧末端保留 12 mm 余量 ⇒ 进入绷紧段时这 12 mm（加上独立控制器 ~5 mm 的稳态余差
+= 17 mm）被一次性收掉 —— 数学上就是一次无人机位置瞬移。
+
+⇒ 正确值就是 **0**：交接点是"绳刚好拉直、张力为零"，此时模型假设与实际一致、无跳变。
+`parameters.m` 里对 `preTensionSlack` 的校验也从 `(0, L)` 放宽到 `[0, L)`；
+`simulation.m` 在切换处会显式检查并**告警**（`takeupSnapWarn`，默认 10 mm），
+不让这种隐性跳变悄悄过去。
+
+> 残余量 ≈ 独立控制器的稳态余差（实测 ~7 mm，已低于 `takeupSnapWarn`）。要再压小它需要提高
+> `takeoff.independentIntegralGain`（积分收敛时间 ≈ `2·Kp/Ki`，当前 0.8 ⇒ 约 10 s，
+> 比 TAKEUP 的 2.4 s 长，所以收敛不完）。
+
+### 地面还要约束**转动**（2026-09-29 补）—— 交接期"30° 绳向误差"的真源头
+
+地面接触原来只约束 z（再加上后面补的水平摩擦），**完全不约束转动**。
+于是交接期负载在地面上**打滚**：
+
+```text
+     t     负载 ωx      ωy      ωz    |ω|     负载高度
+  4.850   −0.266   −1.502   +0.070   1.53    0.0302
+  5.000   +0.571   +2.023   −0.033   2.10    0.0308
+  5.050   +1.384   +2.286   −0.131   2.68    0.0279   ← 高度一直是触地值
+```
+躺在地面上的负载不可能以 ~3 rad/s 翻滚（那要求把一条边抬起来）。
+而它不只是"不好看" —— 角速度经
+
+```text
+Md = -kR*eR0 - kOmega*eOmega0 + ...
+```
+
+直接进**张力分配**：`kOmega = [0.00276, 0.00403, 0.000339]`，`ω = 2.9 rad/s`
+⇒ `|Md|` 可达 **0.012 N·m**；而力臂只有 ~0.04 m ⇒ 等效张力扰动
+`0.012/(3*0.04) ≈ 0.10 N` —— **是绳 2 张力（0.20 N）的一半**
+⇒ **期望绳向 `q_id` 被甩来甩去**，日志里 `eqi = cross(q_id, q_i)` 冲到 **30°**。
+
+> ★★★ **但实际绳向根本没偏那么多。** 用无人机与负载位置**重建**实际绳向（`q_i = (x_0 + R_0 ρ_i − x_i)/‖·‖`，
+> 只用到已经记录的 `sim.vehiclePositionLog` / `sim.loadPositionLog` / `sim.loadRotationLog`），
+> 交接段"实际 q_i 与期望 q_id 的夹角"只有 **1~2°**（同一时刻日志里的 `ler` 是 29.6°）。
+> ⇒ **那个 30° 主要是"被地面上的打滚甩出来的假象"**，不是绳真偏了。
+
+物理上地面应该给恢复力矩：摩擦转矩上限 ≈ `μ*m0*g*rho_typ`，除以 `J0` 得
+角减速度上限 `0.5*0.08*9.81*0.04 / 2.69e-4 ≈ 58 rad/s²`（滚转/俯仰），
+所以触地期转动应当被**锁住**。修法（`simulation.m` 地面接触块内）：
+
+```matlab
+'groundRotationalBrake', 40.0, ...   % 触地时角减速度上限 [rad/s^2]
+```
+
+与水平摩擦一样**随法向力衰减**：张力把负载提起来时制动自然消失。
+
+> ★ 诊断提醒：`sim.linkErrorLog` 是 `||cross(q_id, q_i)||`，**会被 `q_id` 自身的
+> 抖动污染**。查"绳向到底偏没偏"时，除了看这个日志，还要用无人机与负载位置
+> **重建实际绳向**再比一次 —— 两者不一致时，问题往往在"期望"那一侧。
+
+### 交接瞬态：最终结果与残余（2026-09-29 收尾）
+
+**排查过程留下的中间结论**（当时绳向峰值还在 ~30°，现已被下一条修复取代）：
+表现为绳 2/3 从 16° 摆出到 36°/32°，而绳 1 几乎不动 —— 这是**低张力绳**效应：
+绳 1 承担 2 倍张力（`|μ|` 0.399 vs 0.203 N），绳向模态的等效刚度 `~√(T/(m·l))`
+也大约 2 倍 ⇒ 同样激励下绳 1 位移小、绳 2/3 位移大。
+★ 但后来用位置重建发现，那 30° 里**大部分是"期望绳向 `q_id` 自己被甩"**，
+真凶是下一条讲的"负载在地面上打滚"，见《地面还要约束转动》。
+
+**修复后的最终指标**：
+
+| 指标 | 修复前 | 现在 |
+|---|---|---|
+| 绳向误差峰值 | 29.6°（早期曾 36°）| **7.37°** |
+| 负载角速度峰值 | 2.74 rad/s | **0.294 rad/s** |
+| 交接期负载水平漂移 | −0.179 m | **−0.0004 m** |
+| 模式切换位置瞬移 | 17.5 mm | 7.4 mm |
+| 抬升段高度峰值（目标 0.350）| 0.3540（+4 mm）| **0.3506（+0.6 mm）** |
+| 巡航段位置误差 | 0.11 mm | **0.3 mm** |
+| 稳态绳向误差 | 0.096° | **0.081°** |
+
+**残余（已量化，判定为可接受）**：
+
+1. 峰值 7.37° 出现在交接后 0.066 s，主要是**绳 3 的初始偏向**。
+   用位置重建实际绳向看（见上面的"诊断提醒"），
+   绳 3 实际倾角 14.30° vs 平衡 15.27°、方位差 −3.31° ⇒ 真实夹角只有 **1.29°**
+   ⇒ 日志里的 7° 仍有一部分来自 `q_id` 侧，但已是**单数量级**，不再是量级错误。
+2. **张力建立段绳 1/3 有一个缓慢的"张开"**：倾角 12.0°→8.9°（绳1）、
+   14.5°→22.8°（绳3），到 6.27 s 后收敛回平衡。`ler` 全程 ≤7° ⇒ 控制器跟得上，
+   属**可接受的缓变**（对比修复前 36°/32° 的剧烈摆出）。
+3. 模式切换残余瞬移 7.4 mm（原 17.5），来自独立控制器 ~7 mm 的稳态余差；
+   已低于 `takeupSnapWarn = 10 mm`，不再告警。
+
+**若还要继续压（未实施，按风险从低到高）**：
+1. 提高 `linkController.kq` / `komega`（注意：本项目已知 3 机下 `kq` 有稳定上限，加大有风险）；
+2. 缩短 `tensionRampTime`，减少处于"绳向环权限不足"区间的时间；
+3. 让 `tensionScale` **只缩放与张力相关的部分**（`μ_i` 与绳向环项），
+   `m·a_i` 这类惯性前馈不缩放 —— 机理上最对，但属控制器结构改动。
+
 调整起飞流程时优先修改：
 
 ```matlab
 cfg.takeoff.takeoffDuration    % 独立起飞时间
 cfg.takeoff.takeupDuration     % 收紧时间
-cfg.takeoff.tensionRampTime    % 软绷紧时间
+cfg.takeoff.tensionRampTime    % 软绷紧（张力建立）时间
+cfg.takeoff.referenceLiftTime  % 张力建好后，参考抬升到目标的时间
+cfg.takeoff.releaseSnapTolerance % 准许"落地点释放"的离地余量
 cfg.takeoff.landingDuration    % 末段降落时间
+cfg.takeoff.landingApproachFraction % 末段前一部分用绷紧动力学下降
 cfg.takeoff.preTensionSlack    % 收紧末端保留余量
 cfg.takeoff.groundRadialOffset % 地面阶段相对负载中心的安全外张距离
 ```
+
+> `tensionRampTime` 只控制**张力建立**的快慢，不再同时决定参考走多远；
+> 参考走多快由 `referenceLiftTime` 单独控制，两者解耦后互不干扰。
 
 如果只想复现论文的“始终绷紧”模型，可设置 `cfg.takeoff.enabled = false`；此时无人机位置重新由 `x_i=x_0+R_0 rho_i-l_i q_i` 构造，不能用来验证地面起飞冲击。
 
@@ -341,7 +608,17 @@ cfg.takeoff.groundRadialOffset % 地面阶段相对负载中心的安全外张�
 | `loadController.manualKOmega` | **手动指定负载角速度增益** `kOmega`（留空 `[]` = 自动）|
 | `loadController.attitudeMomentRefError` | 折算力矩上限用的参考姿态误差（默认 0.10 rad）|
 | `link.minInFlightTiltRatio` | 空中绳向最小倾角比例（默认 0.20）|
-| `takeoff.*` | 地面接触、独立起飞/降落、绳索收紧和软张力过渡参数 |
+| `link.takeupLinkUnitsBody` | 收紧段绳向（负载体系，派生值；由 `simulation.m` 初始化时调用控制器求得）|
+| `takeoff.preTensionSlack` | 收紧末端保留的绳长余量（默认 **0**，必须 0，见上文）|
+| `takeoff.tensionRampTime` | 张力软建立时间（默认 1.5 s）|
+| `takeoff.referenceLiftTime` | 张力建好后参考抬升到目标的时间（默认 3.0 s）|
+| `takeoff.takeupSnapWarn` | 交接瞬间允许的绳长余量（= 位置瞬移量）告警阈值（默认 10 mm）|
+| `takeoff.releaseSnapTolerance` | 准许"落地点释放"的离地余量（默认 5 mm）|
+| `takeoff.groundFrictionMu` | 负载触地时的水平库仑摩擦系数（默认 0.50）|
+| `takeoff.groundRotationalBrake` | 触地时角减速度上限（默认 40 rad/s²）|
+| `takeoff.groundContactTolerance` | 判定"仍与地面接触"的竖直余量（默认 2 mm）|
+| `takeoff.independentIntegralGate` | 独立控制器位置误差小于它才积分（抗饱和，默认 0.05 m）|
+| `takeoff.*` | 其余地面接触、独立起飞/降落、绳索收紧和软张力过渡参数 |
 
 ## 代码约定
 
@@ -358,7 +635,13 @@ cfg.takeoff.groundRadialOffset % 地面阶段相对负载中心的安全外张�
 3. 运行 `crazyflie_slung_demo('quick')` 做快速自检。
 4. 检查 `summary` 中的 yaw 误差、最小张力、无人机间距和机体-负载间隙。
 5. 再运行完整仿真并检查图形和日志。
-6. 使用 `git diff --check` 检查格式；本工程不包含自动上传 GitHub 的脚本。
+6. **改过起飞/降落流程或地面接触后**，额外核对交接段这几个量：
+   `summary.firstTautTime`、`sim.takeoffModeLog`（各段时长）、`sim.tensionScaleLog`、
+   `sim.linkErrorLog`、`sim.loadBodyRateLog`、`sim.loadPositionLog`（看有没有水平漂移）。
+   ★ 若要看得更细，直接跑 `dump_sim_data` 把关键日志导成 CSV + 诊断报告，
+   用数据而不是看图来判断；`sim.linkErrorLog` 会被"期望绳向"自身的抖动污染，
+   必要时用 `sim.vehiclePositionLog` / `sim.loadPositionLog` **重建实际绳向**再比一次。
+7. 使用 `git diff --check` 检查格式。
 
 ## 免责声明
 

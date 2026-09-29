@@ -110,6 +110,11 @@ end
 modeStartTime = 0;
 tautCandidateStart = nan;
 tautStartTime = nan;
+% ★ 交接瞬间的负载状态快照。TAUT_RAMP 的"参考抬升"必须从这个**冻结**的起点出发，
+%   不能再跟着实测跑（见循环内参考抬升一节）。
+tautStartPosition = state.loadPosition;
+tautStartVelocity = state.loadVelocity;
+landingLagWarned = false;
 landingStartPosition = state.loadPosition;
 groundLoadPosition = state.loadPosition;
 groundLoadPosition(3) = cfg.takeoff.groundZ ...
@@ -121,6 +126,56 @@ if cfg.takeoff.landingEnabled && cfg.simulation.duration > ...
 else
     % 快速冒烟仿真太短时不强行插入降落段，至少保留独立起飞/收紧过程。
     landingStartTime = inf;
+end
+
+% ★★★ 收紧段绳向 = **控制器自身的悬停平衡解**（不再是一个统一的几何偏移）
+%
+% 为什么必须这样（用转储数据定位出来的，不是猜）：
+%   `vehicleTakeupPosition` 原来用 `takeoff.groundRadialOffset`（**一个统一值**）
+%   把三机放到挂点外侧 ⇒ 三根绳的倾角**完全相同**（本参数下 16.4°）。
+%   但悬停张力是 2:1:1，承载大的那根绳更竖直 ⇒ 控制器期望的平衡倾角是三根
+%   **不同**的：实测/复算均为 [10.93, 15.27, 15.27]°。
+%   于是交接瞬间 `eqi` 一开始就有 5.6/1.2/1.0°，绳向环要在 0.2 s 内吞掉这个阶跃
+%   ⇒ 绳向误差冲到 36°、负载角速度 2.9 rad/s、机体速率指令打到限幅。
+%   用平衡绳向布置收紧段后，交接瞬间**实际绳向 == 期望绳向 ⇒ eqi ≡ 0**。
+%
+% ★ 顺带纠正一处概念混淆：`groundRadialOffset` 是**避碰**量
+%   （boundingRadius + collisionRadius + clearance），把它当**动力学**的绳向用
+%   本来就不成立 —— 两个需求互不相关。地面段照旧用它，收紧段改用平衡绳向。
+cfg.link.takeupLinkUnitsBody = equilibriumLinkUnitsBody(state, cfg);
+
+% ★ 安全检查：平衡绳向可能比"地面期的统一外张"更贴近负载（承载大的那根绳更竖直）。
+%   这里只用**体系内**几何（与负载朝向无关）算一遍机-负载最小水平距离。
+%   ★ 判据用**真实碰撞下限** boundingRadius + collisionRadius，
+%     而**不是** 再加上 link.vehicleClearance —— 后者是**地面期**的额外余量，
+%     那时机与负载同高、只能靠水平距离保护；收紧时机在负载上方 0.6 m，
+%     再把地面余量套上来就又是一次"把两种场景的需求混为一谈"。
+%   真低于碰撞下限才告警（不静默放过）。
+takeupQBody = cfg.link.takeupLinkUnitsBody;
+if ~isempty(takeupQBody)
+    takeupDistance = cfg.link.length - cfg.takeoff.preTensionSlack;
+    minTakeupHoriz = inf;
+    for i = 1:n
+        offsetXY = cfg.payload.attachPoints(1:2, i) ...
+            - takeupDistance * takeupQBody(1:2, i);
+        minTakeupHoriz = min(minTakeupHoriz, norm(offsetXY));
+    end
+    collisionDistance = cfg.payload.boundingRadius + cfg.vehicle.collisionRadius;
+    if minTakeupHoriz < collisionDistance
+        warning('crazyflie_slung_simulation:TakeupClearanceTight', ...
+            ['收紧段按平衡绳向布置后，机-负载最小水平距离 %.4f m < ' ...
+             'boundingRadius + collisionRadius = %.4f m（差 %.4f m）——存在碰撞风险。' ...
+             '请调大 allocation.outwardBiasFraction（会同时改变空中平衡绳向），' ...
+             '或缩小负载/增大绳长。'], ...
+            minTakeupHoriz, collisionDistance, collisionDistance - minTakeupHoriz);
+    elseif minTakeupHoriz < collisionDistance + cfg.link.vehicleClearance
+        % 只影响地面期的那份额外余量，报告一次（不阻断）
+        fprintf(['[takeoff] 提示：收紧段最小机-负载水平距离 %.4f m 已小于' ...
+            ' boundingRadius+collisionRadius+vehicleClearance = %.4f m，' ...
+            '但仍高于碰撞下限 %.4f m（按平衡绳向布置是有意为之：交接无冲击）。\n'], ...
+            minTakeupHoriz, collisionDistance + cfg.link.vehicleClearance, ...
+            collisionDistance);
+    end
 end
 
 % ------------------------------------------------------------------ 日志分配
@@ -337,38 +392,134 @@ for k = 1:nSteps
                 end
                 holdTime = t - tautCandidateStart;
                 if allNear && holdTime >= cfg.takeoff.confirmTime
+                    % ★★ "进入绷紧段时会被模型一次性收掉的绳长余量" = 位置瞬移量。
+                    %   本模型只能表示绷紧的绳，所以此刻 |l - d| 会在一拍内被强制归零
+                    %   ⇒ 无人机位置瞬移 |l - d|。实测 preTensionSlack = 12 mm 时
+                    %   瞬移达 17 mm（等效速率 8.5 m/s），会明显激励绳向环。
+                    %   这里显式报出来，不让这种"隐性跳变"悄悄过去。
+                    takeupSnap = cfg.link.length - ropeDistance;
+                    if max(abs(takeupSnap)) > cfg.takeoff.takeupSnapWarn
+                        warning('crazyflie_slung_simulation:TakeupSnap', ...
+                            ['进入绷紧段时绳长余量 [%s] m 会被模型一次性收掉，' ...
+                             '等效于无人机瞬时位移（最大 %.1f mm）。' ...
+                             '把 takeoff.preTensionSlack 取 0 可基本消除' ...
+                             '（残余量来自独立控制器的稳态余差）。'], ...
+                            mat2str(takeupSnap, 4), ...
+                            1000 * max(abs(takeupSnap)));
+                    end
                     mode = 'TAUT_RAMP';
                     modeStartTime = t;
                     tautStartTime = t;
                     memory.linkIntegrals = zeros(3, n);
                     memory.previousLinkUnits = state.linkUnits;
+                    % 独立段的积分器也清零：交接后再也不用它，留着只会在降落段
+                    % 重新启用时带着起飞段的旧偏置（独立控制器已加抗饱和 gate，这里是双保险）。
+                    memory.independentPositionIntegral = zeros(3, n);
+                    % ★ 冻结交接瞬间的负载状态作为"参考抬升"的起点。
+                    tautStartPosition = state.loadPosition;
+                    tautStartVelocity = state.loadVelocity;
                 end
             end
         end
         continue;
     end
 
+    % ★ 本拍是否处于"交接抬升窗口"。每拍先清零，由下面的抬升块置位；
+    %   它同时用于决定**是否允许位置积分器累积**（见控制器调用之后的门控）。
+    inHandoffLift = false;
+
     % LANDING_TAUT 仍使用绷紧段动力学，但把期望负载平滑地送到地面。
     if cfg.takeoff.enabled && strcmp(mode, 'LANDING_TAUT')
         approachDuration = max(0.1, cfg.takeoff.landingDuration ...
             * cfg.takeoff.landingApproachFraction);
         sLanding = clamp((t - modeStartTime) / approachDuration, 0, 1);
-        blend = smoothStep5(sLanding);
-        desired.position = (1 - blend) * landingStartPosition ...
-            + blend * groundLoadPosition;
-        desired.velocity = zeros(3, 1);
-        desired.acceleration = zeros(3, 1);
+        % ★★ 三通道必须同源（同 TAUT_RAMP 的教训）。
+        %   旧写法只动了 desired.position，而 desired.velocity / acceleration 恒为 0
+        %   ⇒ "参考自己在动、速度参考却是 0"，位置环只能靠反馈硬追 ⇒ 负载明显滞后。
+        %   实测（本次转储）：参考 2.2 s 内从 0.350 降到 0.028 m，负载只降到 0.146 m，
+        %   滞后 118 mm；随后释放段不得不用"瞬移"把负载按到地面。
+        %   改用 5 次多项式剖面：位置/速度/加速度同源，两端速度、加速度均为 0，
+        %   与前面的悬停段、后面的释放段都 C^2 连续。
+        %   起点用进入降落段时冻结的 landingStartPosition（不再跟实测跑）。
+        [blend, blendDot, blendDDot] = smoothStep5WithDerivatives(sLanding);
+        dPosLand = groundLoadPosition - landingStartPosition;
+        desired.position = landingStartPosition + blend * dPosLand;
+        desired.velocity = (blendDot / approachDuration) * dPosLand;
+        desired.acceleration = (blendDDot / approachDuration^2) * dPosLand;
         desired.rotation = state.loadRotation;
         desired.bodyRate = zeros(3, 1);
         desired.bodyRateDot = zeros(3, 1);
     end
 
+    % ★★ 起飞交接：先把张力建起来（参考**冻结**），再把参考按受限剖面抬到目标。
+    %
+    %   为什么必须分两段（本次转储数据的结论，不再靠猜）：
+    %   ① 本设计的悬停总张力**恰好等于负载重量**（hoverTensionByLink 合计 = m0 g），
+    %      而 tensionScale 混合的是 uHover = m*g（只抵无人机自重 ⇒ 零张力）。
+    %      所以 tensionScale 从 0 到 1 就是张力从 0 到 m0 g
+    %      ⇒ **只有斜坡末端（tensionScale ≈ 0.9~1.0）负载才可能离地**。
+    %      实测：参考 1.5 s 内从 0.028 升到 0.350 m，而负载到 6.396 s 仍贴地
+    %      ⇒ 位置误差在斜坡末端堆到 0.3925 m，之后负载才在 8.7 s 追上。
+    %   ② 所以斜坡期间任何"往目标拉"的参考都只会变成纯误差。正确顺序是：
+    %      张力建立段（rampT）——参考冻结在交接瞬间的实测状态，误差恒 ≈ 0；
+    %      抬升段（liftT）——参考用 5 次多项式剖面从**冻结起点**走到目标，
+    %      位置/速度/加速度三通道同源（同下一段的教训），两端速度、加速度均为 0。
+    %   ③ 起点必须**冻结**而不能取当前实测值：若锚点是活的，
+    %      desired = 实测 + s·(目标 − 实测) ⇒ 误差只能按比例 s 释放，
+    %      负载不动时误差照样涨满（这正是上一版的行为）。
+    if cfg.takeoff.enabled && ~isnan(tautStartTime)
+        rampT = max(cfg.takeoff.tensionRampTime, eps);
+        liftT = max(cfg.takeoff.referenceLiftTime, eps);
+        tSinceTaut = t - tautStartTime;
+        inLiftWindow = (tSinceTaut >= 0) && (tSinceTaut < rampT + liftT) ...
+            && (strcmp(mode, 'TAUT_RAMP') || strcmp(mode, 'ACTIVE'));
+        if inLiftWindow
+            inHandoffLift = true;
+            sLift = clamp((tSinceTaut - rampT) / liftT, 0, 1);
+            [refBlend, refBlendDot, refBlendDDot] = ...
+                smoothStep5WithDerivatives(sLift);
+            posTarget = desired.position;
+            velTarget = desired.velocity;
+            accTarget = desired.acceleration;
+            dPos = posTarget - tautStartPosition;
+            dVel = velTarget - tautStartVelocity;
+            desired.position     = tautStartPosition + refBlend * dPos;
+            desired.velocity     = tautStartVelocity ...
+                + (refBlendDot / liftT) * dPos + refBlend * dVel;
+            desired.acceleration = (refBlendDDot / liftT^2) * dPos ...
+                + refBlend * accTarget;
+        end
+    end
+
     % -------- 控制器 --------
     [command, memory] = crazyflie_slung_controller(state, desired, memory, cfg);
 
+    % ★★ 非绷紧阶段禁止负载位置积分器累积（2026-09-28 修复）
+    %   机理：TAUT_RAMP 期间控制器照常被调用（斜坡只缩放它的**输出**，见下方
+    %   tensionScale），而此刻负载还贴着地面、离目标高度误差很大
+    %   ⇒ positionIntegral 一路冲到限幅 0.5，斜坡结束时把『憋住的力』
+    %     一次性释放 ⇒ 交接峰值反而更高。
+    %   ★ 实证：把 tensionRampTime 从 1.5 s 拉长到 5.5 s 后，绳向误差峰值
+    %     由 26 deg 恶化到 50~60 deg —— 正是这条机理（斜坡越长憋得越久）。
+    %   所以只在绷紧运输阶段（ACTIVE / LANDING_TAUT）让它累积。
+    %   ★★★ 2026-09-28 修复：这里原写成 'TAUT_ACTIVE'，但状态机里的名字是
+    %     'ACTIVE'（见文件末尾 modeCode 的 case）⇒ 条件恒真 ⇒
+    %     **整个运输段每一步都把 positionIntegral 清零，ki 完全失效**。
+    %     本项目里 'TAUT_ACTIVE' 只是文档/图例里的叫法（README、
+    %     visualization 的标签），代码里的实际字符串是 'ACTIVE'。
+    %     ⇒ 凡是用 strcmp(mode, ...) 的地方，名字**必须**取自 modeCode 的 case。
+    %   ★ 另外，交接抬升窗口（inHandoffLift）里也要清零：那一段是"指令性瞬态"，
+    %     参考由我们自己的前馈剖面给出，残余误差不是常值扰动；若让积分器累积，
+    %     抬升结束时它会带着一份"憋住的力"把负载顶过目标（新的过冲来源）。
+    %   ★ 注意：一旦 'ACTIVE' 的名字改对，ki 就真正生效了 —— 巡航段的行为
+    %     会与之前（ki 被无意清零）不同，需要重新确认。
+    if ~((strcmp(mode, 'ACTIVE') || strcmp(mode, 'LANDING_TAUT')) && ~inHandoffLift)
+        memory.positionIntegral = zeros(3, 1);
+    end
+
     % 绷紧瞬间不要把完整张力阶跃施加到地面负载。把各机期望作用力从
     % 独立悬停力平滑过渡到论文绷紧段作用力；这只是接触阶段的数值/物理
-    % 过渡，TAUT_ACTIVE 中仍完全使用原控制律。
+    % 过渡，ACTIVE 段中仍完全使用原控制律。
     tensionScale = 1.0;
     if strcmp(mode, 'TAUT_RAMP')
         rampS = clamp((t - tautStartTime) / ...
@@ -572,12 +723,83 @@ for k = 1:nSteps
                 state.loadVelocity(3) = 0;
             end
         end
+
+        % ★★ 地面摩擦（2026-09-29 新增）—— 竖直方向夹住了，**水平方向也必须给摩擦**
+        %
+        % 原来这里只有 z 向约束、没有 xy 向摩擦 ⇒ 负载"躺在无摩擦地面上"。
+        % 实测后果（转储数据）：交接期负载高度**一直贴在 0.0279 m（就是触地高度）**，
+        % 却被绳子的水平不平衡力拖走 **0.18 m**（err_x 5.778 s →0，6.9 s →−0.179 m）。
+        % 这条"持续扰动"又反过来改变挂点位置、激励绳向环：
+        % 绳向误差冲到 30°、负载角速度 2.7 rad/s、速率/姿态指令打到限幅。
+        % 但真实情况下静摩擦上限 ~μ*m0*g = 0.24~0.39 N，比那个扰动（~0.06 N）大
+        % 3~6 倍 ⇒ **负载根本不会滑**。所以原来的滑动是**模型缺摩擦**造的假象。
+        %
+        % 实现：库仑摩擦（水平减速度上限 μ*g），且 μ 随**法向力**衰减 ——
+        % 绳把负载往上提 ⇒ 法向力减小 ⇒ 摩擦上限减小；
+        % 张力涨到等于自重时法向力→0、摩擦自然消失，不会把负载"粘"在半空。
+        % 这样离地瞬间是干净的，不需要额外的释放判据。
+        if state.loadPosition(3) >= currentGroundLoadZ ...
+                - cfg.takeoff.groundContactTolerance
+            % ★ 注意本文件里没有 m0 / g 这两个简写（只有 cfg.payload.mass / cfg.vehicle.gravity），
+            %   写 m0*g 会直接报"函数或变量无法识别"。
+            weight = cfg.payload.mass * cfg.vehicle.gravity;
+            normalLoad = weight ...
+                - sum(command.tensions(:).' .* state.linkUnits(3, :));
+            frictionRatio = max(0, min(1, normalLoad / weight));
+            frictionMu = cfg.takeoff.groundFrictionMu * frictionRatio;
+            horizontalSpeed = norm(state.loadVelocity(1:2));
+            if horizontalSpeed > 0 && frictionMu > 0
+                speedDrop = min(frictionMu * cfg.vehicle.gravity * dt, ...
+                    horizontalSpeed);
+                state.loadVelocity(1:2) = state.loadVelocity(1:2) ...
+                    * (1 - speedDrop / horizontalSpeed);
+            end
+
+            % ★★ 地面也**约束转动**（2026-09-29 补）—— 这是交接期"绳向误差 30°"的真源头
+            %
+            % 躺在地面上的负载不可能以 ~3 rad/s 翻滚 —— 那要求把一条边抬起来。
+            % 但原来这里只约束 z、完全不约束转动，于是交接期负载在地面上"打滚"：
+            % 实测 |ω| 达 2.9 rad/s，分量主要在 ω_x/ω_y（ω_z 只有 ~0.1）。
+            %
+            % 后果不只是不真实 —— 角速度经
+            %       Md = -kR*eR0 - kOmega*eOmega0 + ...
+            % 直接进**张力分配**：kOmega = [0.00276, 0.00403, 0.000339]，
+            % ω = 2.9 rad/s ⇒ |Md| 可达 0.012 N·m；而力臂只有 ~0.04 m
+            % ⇒ 等效张力扰动 0.012/(3*0.04) ≈ 0.10 N —— 是绳 2 张力(0.20 N)的一半！
+            % ⇒ **期望绳向 q_id 被甩来甩去**，`eqi = cross(q_id, q_i)` 冲到 30°，
+            %   而实际绳向其实只偏 1~2°（用无人机/负载位置重建可验证：
+            %   `_verify_tools/_diag_link_azimuth.py` 给出重算夹角 ≤2.3°）。
+            % ⇒ 那个"30° 绳向误差"主要是**被地面上的打滚甩出来的假象**。
+            %
+            % 摩擦转矩上限 ≈ mu*m0*g*rho_typ，除以 J0 得角减速度上限：
+            %    0.5 * 0.08 * 9.81 * 0.04 / 2.69e-4 ≈ 58 rad/s²（滚转/俯仰）
+            % 取 40 rad/s^2 已足够锁住触地期的转动；同样随法向力衰减，
+            % 张力把负载提起来时制动自然消失（与水平摩擦一致）。
+            brakeRate = cfg.takeoff.groundRotationalBrake * frictionRatio;
+            bodyRateNorm = norm(state.loadBodyRate);
+            if bodyRateNorm > 0 && brakeRate > 0
+                rateDrop = min(brakeRate * dt, bodyRateNorm);
+                state.loadBodyRate = state.loadBodyRate ...
+                    * (1 - rateDrop / bodyRateNorm);
+            end
+        end
     end
 
     if cfg.takeoff.enabled && strcmp(mode, 'LANDING_TAUT')
         approachDuration = max(0.1, cfg.takeoff.landingDuration ...
             * cfg.takeoff.landingApproachFraction);
-        if t >= modeStartTime + approachDuration
+        % ★★ 释放条件：时刻到了**并且**负载已经落到地面附近。
+        %   旧写法只判时刻 ⇒ 若负载落后于参考（本次实测落后 118 mm），
+        %   释放瞬间 state.loadPosition = groundLoadPosition 会把负载**瞬移**到地面，
+        %   日志上是高度阶跃、物理上是不存在的卸载冲击，而且**不会报错**。
+        %   ⇒ 改成"落到地面附近才释放"，并保证还有绷紧动力学把它压下来；
+        %     超时未落地时不瞬移，只发一次 warning（静默失效是本项目最大的坑）。
+        %   z 轴向下为正 ⇒ 负载"高于地面"时 z < currentGroundLoadZ，
+        %   离地高度 = currentGroundLoadZ - z。
+        nearGround = state.loadPosition(3) >= currentGroundLoadZ ...
+            - cfg.takeoff.releaseSnapTolerance;
+        timeUp = t >= modeStartTime + approachDuration;
+        if timeUp && nearGround
             state.loadPosition = groundLoadPosition;
             state.loadVelocity = zeros(3, 1);
             state.loadBodyRate = zeros(3, 1);
@@ -587,6 +809,13 @@ for k = 1:nSteps
             state.vehicleVelocity = zeros(3, n);
             [~, ~, state.linkUnits, state.linkRates] = ...
                 ropeGeometryFromVehicles(state, cfg);
+        elseif timeUp && ~landingLagWarned
+            landingLagWarned = true;
+            warning('crazyflie_slung_simulation:LandingApproachLag', ...
+                ['下降参考已到地面，但负载仍离地 %.1f mm（> releaseSnapTolerance %.1f mm）。' ...
+                 '继续用绷紧动力学下降，不把负载瞬移到地面。'], ...
+                1000 * (currentGroundLoadZ - state.loadPosition(3)), ...
+                1000 * cfg.takeoff.releaseSnapTolerance);
         end
     elseif cfg.takeoff.enabled && strcmp(mode, 'TAUT_RAMP') ...
             && t >= tautStartTime + cfg.takeoff.tensionRampTime
@@ -1241,7 +1470,7 @@ for i = 1:n
     radial = horizontalRadial(rhoAll(:, i), i, n);
     positions(:, i) = attach + cfg.takeoff.groundRadialOffset * radial;
     if useTakeupHeight
-        positions(:, i) = vehicleTakeupPosition(attach, radial, cfg);
+        positions(:, i) = vehicleTakeupPosition(attach, radial, loadRotation, i, cfg);
     else
         positions(3, i) = cfg.takeoff.groundZ ...
             - cfg.takeoff.vehicleGroundClearance;
@@ -1272,7 +1501,7 @@ for i = 1:n
     attach = loadPosition + loadRotation * rhoAll(:, i);
     radial = horizontalRadial(rhoAll(:, i), i, n);
     if strcmp(mode, 'TAKEUP')
-        takeupPosition = vehicleTakeupPosition(attach, radial, cfg);
+        takeupPosition = vehicleTakeupPosition(attach, radial, loadRotation, i, cfg);
         hoverPosition = attach + cfg.takeoff.groundRadialOffset * radial;
         hoverPosition(3) = cfg.takeoff.groundZ ...
             - cfg.takeoff.independentHoverHeight;
@@ -1298,13 +1527,69 @@ for i = 1:n
 end
 end
 
-function position = vehicleTakeupPosition(attach, radial, cfg)
+function position = vehicleTakeupPosition(attach, radial, loadRotation, index, cfg)
+% 收紧位置：从挂点沿**平衡绳向的反方向**退到 linkLength - preTensionSlack。
+% q_i 由无人机指向负载 ⇒ 无人机 = 挂点 - d*q_i。
+% ★ 用平衡绳向（`cfg.link.takeupLinkUnitsBody`，由控制器给出）而不是统一的
+%   groundRadialOffset，这样交接瞬间实际绳向 == 期望绳向（eqi ≡ 0）。
+%   qBody 为空（控制器求平衡解失败）时退回旧的统一外张几何并已发过 warning。
 targetDistance = cfg.link.length - cfg.takeoff.preTensionSlack;
-horizontalDistance = min(cfg.takeoff.groundRadialOffset, ...
-    0.85 * targetDistance);
+qBodyAll = cfg.link.takeupLinkUnitsBody;
+if ~isempty(qBodyAll)
+    qInertial = normalizeVector(loadRotation * qBodyAll(:, index));
+    position = attach - targetDistance * qInertial;
+    return
+end
+horizontalDistance = min(cfg.takeoff.groundRadialOffset, 0.85 * targetDistance);
 verticalDistance = sqrt(max(targetDistance^2 - horizontalDistance^2, 0));
 position = attach + horizontalDistance * radial;
 position(3) = attach(3) - verticalDistance;
+end
+
+function qBody = equilibriumLinkUnitsBody(state, cfg)
+%EQUILIBRIUMLINKUNITSBODY 求悬停平衡时控制器**期望**的绳向（负载体系 3 x n）。
+%
+% 做法：构造一个"悬停平衡"的 desired，让控制器算一次分配，取它的期望绳向：
+%   * ex = 0、ev = 0（desired 取实测位置/零速度）⇒ Fd = -m0*g*e3；
+%   * eR0 = 0、eOmega0 = 0（desired 姿态取实测）⇒ Md = 0。
+%   此时分配结果只由挂点几何与零空间"外张偏置"决定，**与增益无关**
+%   （kx/kv/ki/kR/kOmega 改多少都不影响这个平衡绳向）。
+%
+% ★ 为什么不在这里重抄一遍分配公式：分配（含外张偏置、零空间投影）是控制器的
+%   内部约定，重抄一份必然随控制器改动而漂移 —— 本项目已经因为"同一个量被两处
+%   定义"踩过坑（defaultLinkUnits 与 vehicleTakeupPosition 给出 7.2° 与 16.0° 两种
+%   "收紧绳向"）。直接把控制器当作平衡绳向的唯一权威最省事也最不容易错。
+% ★ 返回**负载体系**下的方向：分配本身就是在体系里做的（P 用 rho_i，rhs6 用
+%   R0'*Fd），所以这样得到的收紧几何与"负载当时转了多少"无关，天然自洽。
+n = cfg.vehicle.count;
+qBody = [];
+desired = struct();
+desired.position = state.loadPosition;
+desired.velocity = zeros(3, 1);
+desired.acceleration = zeros(3, 1);
+desired.rotation = state.loadRotation;
+desired.bodyRate = zeros(3, 1);
+desired.bodyRateDot = zeros(3, 1);
+% 一次性 memory 副本：绝不污染真实的跨步积分器/差分状态
+probe = struct();
+probe.positionIntegral = zeros(3, 1);
+probe.linkIntegrals = zeros(3, n);
+probe.previousLinkUnits = cfg.initial.linkUnits;
+probe.independentPositionIntegral = zeros(3, n);
+try
+    command = crazyflie_slung_controller(state, desired, probe, cfg);
+    qInertial = command.desiredLinkUnits;
+    if any(~isfinite(qInertial(:)))
+        error('crazyflie_slung_simulation:NonFiniteEquilibrium', ...
+            '悬停平衡绳向含非有限值。');
+    end
+    qBody = state.loadRotation.' * qInertial;
+catch err
+    qBody = [];
+    warning('crazyflie_slung_simulation:TakeupGeometryFallback', ...
+        ['求悬停平衡绳向失败（%s）⇒ 收紧段退回 groundRadialOffset 几何，' ...
+         '交接瞬间会有较大的绳向阶跃（实测可达 36°）。'], err.message);
+end
 end
 
 function [distance, slack, qAll, qdAll] = ropeGeometryFromVehicles(state, cfg)

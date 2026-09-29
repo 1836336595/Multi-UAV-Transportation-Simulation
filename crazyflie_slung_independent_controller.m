@@ -50,12 +50,23 @@ for i = 1:n
     ep = p - desiredPosition(:, i);
     ev = v - desiredVelocity(:, i);
     integralRate = ev + 0.5 * ep;
-    memory.independentPositionIntegral(:, i) = ...
-        memory.independentPositionIntegral(:, i) + dt * integralRate;
-    memory.independentPositionIntegral(:, i) = clampVector(...
-        memory.independentPositionIntegral(:, i), ...
-        -cfg.takeoff.independentIntegralLimit(:), ...
-        cfg.takeoff.independentIntegralLimit(:));
+    % ★★ 抗积分饱和（2026-09-29 新增）：位置误差大时**不积分**。
+    %   原来无条件积分，而 SLACK/TAKEUP 是"从 0.3 m 外飞向目标"的大机动：
+    %   一路灌到限幅附近（Ki=0.8、限幅 0.20 ⇒ 最大 0.16 m/s² 的恒定力偏置），
+    %   等停下来时这个偏置还在 ⇒ 无人机被稳稳压在目标**下方 18 mm**。
+    %   实测后果：收紧结束时绳长停在 0.6200 m = l − 0.0300，**正好落在
+    %   epsilonOn = 0.030 的判据边界上** ⇒ "绳是否绷紧"变成临界判断，
+    %   确认时间被拖长（TAKEUP 实际持续 3.28 s 而不是 takeupDuration 的 2.5 s）。
+    %   加上 gate 后：大机动段积分器不动（不影响跟踪），
+    %   误差进入 gate 后才积分 ⇒ 稳态余差被收干净，收紧长度能到设计值 l−0.012。
+    if norm(ep) < cfg.takeoff.independentIntegralGate
+        memory.independentPositionIntegral(:, i) = ...
+            memory.independentPositionIntegral(:, i) + dt * integralRate;
+        memory.independentPositionIntegral(:, i) = clampVector(...
+            memory.independentPositionIntegral(:, i), ...
+            -cfg.takeoff.independentIntegralLimit(:), ...
+            cfg.takeoff.independentIntegralLimit(:));
+    end
 
     % Kp/Kv/Ki are acceleration gains.  Convert the complete translational
     % command to force here; omitting m makes the feedback roughly 30 times

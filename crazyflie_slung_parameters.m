@@ -145,15 +145,21 @@ cfg.takeoff = struct(...
     'landingEnabled', true, ...
     'groundZ', 0.0, ...                         % 地面 z 坐标（惯性系）
     'vehicleGroundClearance', 0.045, ...        % 机体中心离地高度 [m]
+    'groundFrictionMu', 0.50, ...               % 负载触地时的库仑摩擦系数
+    'groundRotationalBrake', 40.0, ...          % 触地时角减速度上限 [rad/s^2]
+    'groundContactTolerance', 0.002, ...        % 判定"仍在地面接触"的竖直余量 [m]
     'groundRadialOffset', NaN, ...              % 起降阶段相对负载中心的安全外张 [m]
     'independentHoverHeight', 0.30, ...         % 起飞段目标离地高度 [m]
     'takeoffDuration', 2.5, ...                % 独立起飞到收紧高度 [s]
     'takeupDuration', 2.5, ...                  % 从收紧高度缓慢接近绳长 [s]
-    'preTensionSlack', 0.012, ...               % 收紧末端保留的绳长余量 [m]
+    'preTensionSlack', 0.0, ...                 % 收紧末端保留的绳长余量 [m]（★ 必须 0，见下）
+    'takeupSnapWarn', 0.010, ...                % 交接瞬移超过它就告警 [m]
     'epsilonOn', 0.030, ...                     % 进入绷紧候选的距离余量 [m]
     'epsilonOff', 0.060, ...                    % 释放判据的距离余量 [m]
     'confirmTime', 0.30, ...                    % 距离条件持续时间 [s]
     'tensionRampTime', 1.50, ...                % 张力软建立时间 [s]
+    'referenceLiftTime', 3.00, ...              % 张力建好后参考抬升到目标的时间 [s]
+    'releaseSnapTolerance', 0.005, ...          % 准许"落地点释放"的离地余量 [m]
     'landingDuration', 4.0, ...                 % 末段受控下降 + 独立降落 [s]
     'landingApproachFraction', 0.55, ...        % 前一部分仍由绷紧动力学下降
     'independentPositionKp', [3.0; 3.0; 4.0], ...
@@ -161,8 +167,21 @@ cfg.takeoff = struct(...
     'independentIntegralGain', [0.80; 0.80; 0.80], ...
     'independentMaxFeedbackAcceleration', [6.0; 6.0; 8.0], ...
     'independentIntegralLimit', [0.20; 0.20; 0.20], ...
+    'independentIntegralGate', 0.050, ...        % 位置误差小于它才积分（抗饱和）[m]
     'independentMaxBodyRate', [5.0; 5.0; 3.5], ...
     'independentHeading', [1; 0; 0]);
+
+% ★★ 为什么 takeoff.preTensionSlack 必须是 0（2026-09-29）★★
+%   本模型**只能表示绷紧的绳**（松弛段按设计未实现）。而"收紧末端保留 σ 的绳长余量"
+%   在数学上等价于"进入绷紧段时把 σ 一次性收掉" —— 实测 σ = 12 mm 时表现为
+%   **三架无人机在 2 ms 内同时瞬移 17 mm**（12 mm 余量 + 5 mm 独立控制器稳态余差，
+%   等效速率 8.5 m/s），直接激励绳向环。
+%   ⇒ 正确的交接点是"绳刚好拉直、张力为零"，即 σ = 0。
+%   σ > 0 仍可设置（校验允许 [0, L)），但会在交接瞬间产生同样大小的瞬移，
+%   此时 simulation.m 会按 takeoff.takeupSnapWarn 发出 warning。
+%   残余量 ≈ 独立控制器的稳态余差（实测 ~5 mm）；要再压小需提高
+%   independentIntegralGain（积分收敛时间 ≈ 2*Kp/Ki，当前 0.8 ⇒ 约 10 s，
+%   比 TAKEUP 的 2.4 s 长，所以收敛不完）。
 
 % ------------------------------------------- 负载位置/姿态外环（论文 (20)-(21)）
 % ★ 重要：论文 (20) 式的等效质量是 **m0**（负载质量），不是 (m0 + sum m_i)。
@@ -811,6 +830,13 @@ end
 cfg.takeoff.groundRadialOffset = min(max(cfg.takeoff.groundRadialOffset, 0), ...
     0.85 * cfg.link.length);
 
+% ★★ 收紧段绳向（负载体系，3 x n）—— 由 **simulation.m 在初始化时**填入：
+%   它调用控制器自身算一遍悬停平衡解，取那时的期望绳向。
+%   这样"收紧段把无人机放到哪"与"控制器期望绳在哪"是**同一个来源**，
+%   不会像以前那样由一个统一的 groundRadialOffset 冒充动力学绳向。
+%   为空时 simulation.m 会退回旧的统一外张几何（并发 warning）。
+cfg.link.takeupLinkUnitsBody = [];
+
 % ======================================================================
 % ★★★ 外张机制按『碰撞缺口』自适应 —— 2026-09-27 新增
 %
@@ -869,10 +895,16 @@ if cfg.takeoff.epsilonOff <= cfg.takeoff.epsilonOn
     error('crazyflie_slung_parameters:BadTakeoffHysteresis', ...
         'takeoff.epsilonOff 必须大于 epsilonOn。');
 end
-if cfg.takeoff.preTensionSlack <= 0 || ...
+% ★★ preTensionSlack 必须允许 0（默认就是 0），理由见下面的说明 ★★
+%   本模型**只能表示绷紧的绳**（松弛段未实现）。所以"收紧末端保留 σ 的绳长余量"
+%   在数学上等价于"进入绷紧段时把 σ 一次性收掉"—— 实测那是一次 **17 mm 的
+%   无人机位置瞬移**（等价速率 8.5 m/s），直接激励绳向环。
+%   ⇒ 正确的交接点是"绳刚好拉直、张力为零"，即 σ = 0。
+%   （σ > 0 仍然允许，但会在交接瞬间产生同样大小的瞬移，会发 warning。）
+if cfg.takeoff.preTensionSlack < 0 || ...
         cfg.takeoff.preTensionSlack >= cfg.link.length
     error('crazyflie_slung_parameters:BadTakeupSlack', ...
-        'takeoff.preTensionSlack 必须在 (0, link.length) 内。');
+        'takeoff.preTensionSlack 必须在 [0, link.length) 内（本模型建议取 0）。');
 end
 
 % 用户只改 rpy 时自动重算旋转矩阵
