@@ -1,4 +1,23 @@
-# Geometric Control of Cable-Suspended Rigid Body
+# 带公式版 README（LaTeX）
+
+> **这份是"带公式"的版本**，保留了 LaTeX 数学块（用成对的美元符号定界）。
+> 请用**支持数学公式的 Markdown 编辑器**打开：Typora、VS Code
+> （+ Markdown Preview Enhanced / Markdown All in One）、Obsidian、Zettlr 都可以。
+>
+> ★ **在 GitHub 网页上直接看这一份，公式会显示成美元符号原文** —— 这是预期的，
+> 因为这里依赖的数学渲染在网页端不一定生效。**想看能正常显示的版本请用 `README.md`**
+> （它也默认作为仓库首页展示）。
+>
+> | 文件 | 公式写法 | 适用场景 |
+> |---|---|---|
+> | `README.md` | 纯文本 / Unicode | **GitHub 网页**、Gitee、终端、任意编辑器（仓库默认展示）|
+> | `README_local.md`（本文件）| LaTeX | 本地用 Typora / VS Code / Obsidian 阅读 |
+>
+> 两份正文内容一致，只有公式写法不同；**改内容时两份都要改**。
+
+---
+
+## Geometric Control of Cable-Suspended Rigid Body
 
 三架 Crazyflie 2.1 Brushless 协同吊运刚体负载的 MATLAB 仿真工程，基于 Lee 2014/2018 的几何控制框架。本分支使用八字轨迹、负载 yaw 参考和倾斜缆绳构型。
 
@@ -9,10 +28,10 @@
 3. 缆绳允许倾斜，无人机不被强制放在负载正上方；
 4. 小尺寸负载通过张力分配零空间的外张内部力降低无人机碰撞风险。
 
-> **关于文档**：本仓库有两份 README。**本文件**的公式全部写成纯文本 / Unicode，
-> 在 GitHub 网页、Gitee、终端、任意编辑器里都能正常显示；`README_local.md` 保留了
-> LaTeX 公式，适合本地用 Typora / VS Code / Obsidian 阅读（在 GitHub 网页上它的公式
-> 会显示成美元符号原文）。两份正文一致，只有公式写法不同。
+> **关于文档**：本仓库有两份 README。`README.md` 的公式全部写成纯文本 / Unicode，
+> 在 GitHub 网页、Gitee、终端、任意编辑器里都能正常显示；**本文件**保留了 LaTeX 公式，
+> 适合本地用 Typora / VS Code / Obsidian 阅读（在 GitHub 网页上公式会显示成美元符号原文）。
+> 两份正文一致，只有公式写法不同。
 
 ## 运行环境
 
@@ -41,7 +60,7 @@ report = crazyflie_slung_demo();         % 完整仿真、自检和可视化
 | `crazyflie_slung_demo.m` | 一键仿真和自检报告 |
 | `crazyflie_slung_visualization.m` | 轨迹和三维构型可视化 |
 | `crazyflie_slung_diagnose.m` | 数值异常和发散起点定位 |
-| `README_local.md` | 本 README 的**带公式版**（保留 LaTeX）。用 Typora / VS Code / Obsidian 本地阅读时看它；**在 GitHub 网页上它的公式会显示成美元符号原文**，网页阅读请用本文件 |
+| `README.md` | **GitHub 网页阅读版**：公式为纯文本 / Unicode，任何环境都能显示（仓库默认展示）|
 | `ENGINEERING_LOG.md` | 公式、修改原因和调参记录 |
 
 ## 修改负载尺寸
@@ -56,19 +75,23 @@ sim = crazyflie_slung_simulation(cfg);
 
 默认挂点模板为：
 
-```text
-ρ1 = (  a/2,    0 ,  -c/2 )        a = 长, b = 宽, c = 高
-ρ2 = ( -a/2,   b/2,  -c/2 )        即：一边中点 + 对边两个顶点
-ρ3 = ( -a/2,  -b/2,  -c/2 )        三者都在上表面 (z = -c/2)
-```
+$$
+\rho_1=(a/2,0,-c/2),\quad
+\rho_2=(-a/2,b/2,-c/2),\quad
+\rho_3=(-a/2,-b/2,-c/2).
+$$
 
 代码通过无量纲 `payload.attachFractions` 乘以 `payload.size` 生成实际挂点，因此尺寸变化后挂点仍位于负载上表面边界。显式提供 `userCfg.payload.attachPoints` 时，用户挂点优先，但必须为 `3 x n` 且列数等于无人机数量。
 
 均质长方体惯量自动计算为：
 
-```text
-J0 = diag( m0·(b² + c²)/12 ,  m0·(a² + c²)/12 ,  m0·(a² + b²)/12 )
-```
+$$
+J_0=\operatorname{diag}\left(
+\frac{m_0(b^2+c^2)}{12},
+\frac{m_0(a^2+c^2)}{12},
+\frac{m_0(a^2+b^2)}{12}
+\right).
+$$
 
 同时更新 `payload.inertia`、`volume`、`surfaceArea`、`boundingRadius`、`rotationalDamping`、`loadController.kR` 和 `loadController.kOmega`。默认质量独立于尺寸；若要模拟同密度物品，省略 `mass` 并提供：
 
@@ -86,18 +109,18 @@ cfg = crazyflie_slung_parameters(userCfg);
 
 - 偏航惯量随尺寸变化：
 
-```text
-J0z = m0·(a² + b²)/12          ← 绕竖直轴的惯量
-```
+$$
+  J_{0z}=\frac{m_0(a^2+b^2)}{12}.
+$$
 
 - 挂点力臂 `rho_i` 变化，从而改变张力分配矩阵 `P` 和各根缆绳承担的水平张力；
 - 负载包络、缆绳倾角和无人机碰撞裕度发生变化；
 - yaw 增益根据新的 `J0` 自动重算：
 
-```text
-k_Rz  = J0z · ω_nz²
-k_Ωz  = 2 · ζ · ω_nz · J0z
-```
+$$
+  k_{R,z}=J_{0z}\omega_{n,z}^2,\qquad
+  k_{\Omega,z}=2\zeta\omega_{n,z}J_{0z}.
+$$
 
 默认 yaw 目标带宽为 `0.80 Hz`。因此程序会尽量保持相似的归一化 yaw 动态，
 但尺寸变化后仍应重新检查 `steadyYawTrackingError`、`maxYawTrackingError`、
@@ -119,14 +142,9 @@ cfg.loadController.yawChannelEnabled = true;
 
 控制器先计算负载 SO(3) 姿态误差和期望力矩 `Md`，再通过
 
-```text
-        [   I        I        I      ]      <- 前 3 行
-P  =    [                              ]          P 是 6 x 3n
-        [  hat(ρ1) hat(ρ2) hat(ρ3)   ]      <- 后 3 行
-
-  I        = 3x3 单位阵
-  hat(ρ)   = 由 ρ 生成的 3x3 反对称阵
-```
+$$
+P=\begin{bmatrix}I&I&I\\\widehat\rho_1&\widehat\rho_2&\widehat\rho_3\end{bmatrix}
+$$
 
 把合力和合力矩分配到各根缆绳。yaw 力矩由缆绳的水平张力分量传递；默认目标带宽为 `0.80 Hz`，低带宽只表示避免激励摆动，不表示关闭 yaw。`yawChannelEnabled=false` 时才会在控制器中清零 yaw 力矩。
 
@@ -142,9 +160,9 @@ cfg.link.allowTiltedCables = true;
 
 控制器在最小范数张力解上加入内部力，并满足：
 
-```text
-P · μ_internal = 0
-```
+$$
+P\mu_{\mathrm{internal}}=0.
+$$
 
 因此内部力不改变负载期望合力和合力矩，只改变各根缆绳的空间分布，使无人机从挂点正上方适度向外侧分开：
 
@@ -157,9 +175,9 @@ cfg.link.vehicleClearance = 0.02;
 
 缆绳约束仍为：
 
-```text
-x_i = x_0 + R_0·ρ_i − l_i·q_i ,      ‖q_i‖ = 1
-```
+$$
+x_i=x_0+R_0\rho_i-l_iq_i,\qquad \|q_i\|=1.
+$$
 
 自检不再要求 `q_i=e_3` 或无人机位于负载正上方，而是检查绳长、张力正性、无人机间距、无人机与负载外接包络间隙和垂直净空诊断。
 
