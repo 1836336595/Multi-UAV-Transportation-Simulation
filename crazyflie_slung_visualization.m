@@ -228,6 +228,73 @@ if isfield(sim, 'takeoffModeLog') && isfield(sim, 'ropeSlackLog')
     ylim([-0.3, 5.3]);
     legend({'阶段', '张力软启动比例'}, 'Location', 'best');
 end
+
+% 各机**机体**姿态角单独成图。
+% ★ 与上面第 6 格的"负载偏航角"不是一回事：那个是**负载**的姿态，
+%   这里是每架四旋翼**自己**的 roll/pitch/yaw。
+plotVehicleAttitude(sim, cfg);
+end
+
+% ======================================================================
+function plotVehicleAttitude(sim, cfg)
+%PLOTVEHICLEATTITUDE 各架四旋翼的机体姿态角（roll / pitch / yaw）随时间变化。
+%
+% 三个子图各一条时间曲线×n 架（本工况 n=3 ⇒ 共 3x3 = 9 条）。
+%
+% 姿态角由 rotationLog 中的旋转矩阵按 **ZYX 欧拉角**反解，与
+% crazyflie_slung_parameters.m 的 rpyToRotm 是同一个约定
+% （R = Rz(yaw) * Ry(pitch) * Rx(roll)）：
+%     pitch = atan2( -R(3,1), sqrt(R(1,1)^2 + R(2,1)^2) )
+%     roll  = atan2(  R(3,2), R(3,3) )
+%     yaw   = atan2(  R(2,1), R(1,1) )
+% 这里用 atan2 而不是 asin(-R(3,1))，避免俯仰接近 ±90° 时的数值退化。
+%
+% yaw 在 ±180° 处会跳变，做一次解卷绕（复用本文件的 unwrapLocal）；
+% roll / pitch 不跨割线，不需要解卷绕。
+
+if ~isfield(sim, 'rotationLog')
+    return      % 旧日志没有该字段时安静跳过，不影响其它图
+end
+
+n = cfg.vehicle.count;
+time = sim.time;
+nSteps = numel(time);
+R = sim.rotationLog;                       % 3 x 3 x n x nSteps
+
+% ★ 三轴各自存成 **n x nSteps 的二维矩阵**，不要写成 `rpy(1, :, :) = <n x nSteps>`：
+%   那种"把二维矩阵赋给三维切片"的写法形状不匹配（1xnxnSteps vs nxnSteps），
+%   MATLAB 的行为依赖版本/上下文，容易变成静默广播。全用二维就没有歧义。
+%   （R(3,2,:,:) 是 [1 1 n nSteps]，按列主序 reshape 成 [n nSteps] 后
+%     行 = 机体序号、列 = 时间步，已用 Python 逐元素验证过。）
+rollSeries  = rad2deg(atan2(reshape(R(3, 2, :, :), n, nSteps), ...
+                            reshape(R(3, 3, :, :), n, nSteps)));
+pitchSeries = rad2deg(atan2(-reshape(R(3, 1, :, :), n, nSteps), ...
+    sqrt(reshape(R(1, 1, :, :), n, nSteps).^2 ...
+       + reshape(R(2, 1, :, :), n, nSteps).^2)));
+yawSeries   = rad2deg(atan2(reshape(R(2, 1, :, :), n, nSteps), ...
+                            reshape(R(1, 1, :, :), n, nSteps)));
+for i = 1:n
+    yawSeries(i, :) = unwrapLocal(yawSeries(i, :));
+end
+series = {rollSeries, pitchSeries, yawSeries};
+
+titles = {'滚转角 roll', '俯仰角 pitch', '偏航角 yaw（已解卷绕，仅作观测）'};
+colors = lineColors(n);
+figure('Name', '四旋翼机体姿态角（roll / pitch / yaw）', 'Color', 'w', ...
+    'Position', [200, 60, 900, 760]);
+for a = 1:3
+    subplot(3, 1, a);
+    hold on; grid on;
+    for i = 1:n
+        plot(time, series{a}(i, :), 'LineWidth', 1.1, 'Color', colors(i, :));
+    end
+    ylabel(sprintf('%s (°)', titles{a}));
+    title(sprintf('%s   |   %d 架中最大绝对值 %.2f°', ...
+        titles{a}, n, max(abs(series{a}(:)))));
+    legend(arrayfun(@(i) sprintf('机 %d', i), 1:n, 'UniformOutput', false), ...
+        'Location', 'best');
+end
+xlabel('时间 (s)');
 end
 
 % ======================================================================
@@ -255,18 +322,6 @@ hold(ax, 'on'); grid(ax, 'on'); axis(ax, 'equal');
 % 0.1 m 量级的机体和负载会缩成一个点，完全看不出仿的是什么。
 refPoints = [squeeze(vehDisplay(:, :, 1)), loadDisplay(:, 1), ...
     [cfg.target.position(1); cfg.target.position(2); -cfg.target.position(3)]];
-% ★ 八字工况下必须把**期望轨迹本身**也纳入坐标范围，
-%   否则前 3 s 的起飞段（原地上升）会把轴框定得很小，
-%   等负载飞到 ±1.5 m 时四旋翼直接跑出画面。
-refPoints = [refPoints, referencePathPoints(cfg)];
-% ★ 障碍物也要纳入，否则锥可能被裁掉一半。
-if isfield(cfg, 'obstacles') && isfield(cfg.obstacles, 'enabled') ...
-        && cfg.obstacles.enabled
-    obsEdge = cfg.obstacles.positions + cfg.obstacles.radius;
-    obsEdge = [obsEdge, cfg.obstacles.positions - cfg.obstacles.radius];
-    refPoints = [refPoints, [obsEdge(1, :); obsEdge(2, :); ...
-        -cfg.obstacles.baseZ * ones(1, size(obsEdge, 2))]];
-end
 limitLo = min(refPoints, [], 2) - cfg.visualization.axisPadding;
 limitHi = max(refPoints, [], 2) + cfg.visualization.axisPadding;
 span = max(limitHi - limitLo);
@@ -341,11 +396,6 @@ rotorUnit = [cos(linspace(0, 2 * pi, nRotorSeg + 1)); ...
 plot3(ax, cfg.target.position(1), cfg.target.position(2), ...
     -cfg.target.position(3), 'p', 'MarkerSize', 14, ...
     'MarkerFaceColor', [0.85, 0.25, 0.10], 'Color', [0.85, 0.25, 0.10]);
-% ★ 期望八字轨迹（细虚线）与两个锥形障碍物：对应论文 Fig. 3
-%   "following a figure-eight curve around two obstacles represented by cones"。
-%   画在动态元素之前，保证它们在最底层，不会挡住四旋翼和负载。
-drawObstacles(ax, cfg);
-drawDesiredPath(ax, cfg);
 plot3(ax, loadDisplay(1, :), loadDisplay(2, :), loadDisplay(3, :), '-', ...
     'Color', [0.75, 0.82, 0.92], 'LineWidth', 1.0);
 drawTrajectories(ax, vehDisplay, n);
@@ -505,116 +555,6 @@ for i = 1:n
 end
 end
 
-% ======================================================================
-function pts = referencePathPoints(cfg)
-% 采样期望八字轨迹（显示系，z 已取反），用于确定坐标轴范围。
-pts = zeros(3, 0);
-if ~isfield(cfg, 'referenceFcn') || isempty(cfg.referenceFcn) ...
-        || ~isfield(cfg, 'figureEight')
-    return;
-end
-nSamp = 400;
-tGrid = linspace(0, cfg.simulation.duration, nSamp);
-for k = 1:nSamp
-    try
-        [p, ~, ~, ~, ~, ~] = cfg.referenceFcn(tGrid(k));
-        pts(:, k) = [p(1); p(2); -p(3)];
-    catch
-        return;   % 轨迹函数不可用时静默退回（不阻断可视化）
-    end
-end
-end
-
-% ======================================================================
-function drawDesiredPath(ax, cfg)
-% 画期望的八字轨迹：细虚线，环绕段用实色强调。
-if ~isfield(cfg.visualization, 'showReferencePath') ...
-        || ~cfg.visualization.showReferencePath
-    return;
-end
-if ~isfield(cfg, 'referenceFcn') || isempty(cfg.referenceFcn)
-    return;
-end
-nSamp = 600;
-tGrid = linspace(0, cfg.simulation.duration, nSamp);
-xyz = nan(3, nSamp);
-for k = 1:nSamp
-    try
-        [p, ~, ~, ~, ~, ~] = cfg.referenceFcn(tGrid(k));
-        xyz(:, k) = [p(1); p(2); -p(3)];
-    catch
-        xyz = nan(3, nSamp);
-        break;
-    end
-end
-if all(isnan(xyz(:)))
-    return;
-end
-plot3(ax, xyz(1, :), xyz(2, :), xyz(3, :), '--', ...
-    'Color', [0.55, 0.55, 0.60], 'LineWidth', 1.2);
-% ★ 环绕段（即八字本体）用更醒目的绿色点线重复一遍，
-%   让"绕八字"这件事在三维图里一眼可见。
-t1 = cfg.figureEight.takeoffDuration;
-t2 = t1 + cfg.figureEight.cruiseDuration;
-inCruise = tGrid >= t1 & tGrid <= t2;
-if any(inCruise)
-    plot3(ax, xyz(1, inCruise), xyz(2, inCruise), xyz(3, inCruise), '-', ...
-        'Color', [0.15, 0.62, 0.30], 'LineWidth', 1.8);
-end
-% 起点与环绕段入口标记
-plot3(ax, xyz(1, 1), xyz(2, 1), xyz(3, 1), 'o', 'MarkerSize', 7, ...
-    'MarkerFaceColor', [0.30, 0.60, 0.90], 'Color', [0.10, 0.30, 0.60]);
-idxIn = find(inCruise, 1, 'first');
-if ~isempty(idxIn)
-    plot3(ax, xyz(1, idxIn), xyz(2, idxIn), xyz(3, idxIn), 's', 'MarkerSize', 8, ...
-        'MarkerFaceColor', [0.95, 0.75, 0.15], 'Color', [0.55, 0.40, 0.05]);
-end
-end
-
-% ======================================================================
-function drawObstacles(ax, cfg)
-% 两个锥形障碍物（论文 Fig. 3 "two obstacles represented by cones"）。
-% 用 nSeg 边棱锥近似圆锥：顶点 + 底面圆环，纯显示，不参与动力学。
-%
-% ★ 面片必须显式构造，不能像折线那样"把点首尾拼起来"——
-%   棱锥的顶点要参与每一个三角面，拼接顺序写错会画成一团乱麻。
-if ~isfield(cfg, 'obstacles') || ~isfield(cfg.obstacles, 'enabled') ...
-        || ~cfg.obstacles.enabled
-    return;
-end
-nSeg = 24;
-theta = linspace(0, 2 * pi, nSeg + 1);
-% ★ 显示系是 z 向上，而物理系 z 向下为正，两者关系为 zDisplay = -zPhysical。
-%   锥底在物理 z = baseZ（离地 hBase = -baseZ），锥尖在物理 z = baseZ - height
-%   （即更高处）。换算到显示系：
-%       底面高度 = -baseZ                （baseZ = 0 时即地面 0）
-%       尖端高度 = -baseZ + height        （比底面**高** height）
-%   ★ 旧代码写 zTop = zBase + height 且把尖端放在 zTop，
-%     在 baseZ = 0 时会把锥**倒过来**画（尖端朝下扎进地里）。
-zBase = -cfg.obstacles.baseZ;                 % 显示系里的锥底高度
-zApex = zBase + cfg.obstacles.height;         % 显示系里的锥尖高度（更高）
-nObs = size(cfg.obstacles.positions, 2);
-for k = 1:nObs
-    cx = cfg.obstacles.positions(1, k);
-    cy = cfg.obstacles.positions(2, k);
-    R = cfg.obstacles.radius;
-    % 顶点表：1 = 锥尖，2..nSeg+2 = 底面圆环（最后一点与第 2 点重合）
-    V = [cx, cy, zApex; ...
-         cx + R * cos(theta(:)), cy + R * sin(theta(:)), zBase * ones(nSeg + 1, 1)];
-    % 侧面三角面 + 底面扇形
-    F = zeros(nSeg * 2, 3);
-    for s = 1:nSeg
-        F(s, :) = [1, s + 1, s + 2];
-    end
-    for s = 1:nSeg
-        F(nSeg + s, :) = [nSeg + 2, s + 1, s + 2];
-    end
-    patch(ax, 'Vertices', V, 'Faces', F, ...
-        'FaceColor', [0.92, 0.45, 0.20], 'FaceAlpha', 0.55, ...
-        'EdgeColor', [0.65, 0.25, 0.08], 'LineWidth', 0.6);
-end
-end
-
 function colors = lineColors(n)
 % n 架四旋翼的区分色（生成式，不依赖工具箱）。
 base = [0.85, 0.33, 0.10; 0.10, 0.55, 0.85; 0.20, 0.65, 0.30; ...
@@ -634,7 +574,7 @@ switch code
     case 2
         label = 'TAUT_RAMP 软绷紧';
     case 3
-        label = 'TAUT_ACTIVE 协同运输';
+        label = 'ACTIVE 协同运输';
     case 4
         label = 'LANDING_TAUT 受控下降';
     case 5

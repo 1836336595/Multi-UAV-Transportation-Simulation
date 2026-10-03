@@ -61,7 +61,7 @@ for i = 1:n
 end
 state.rotations = zeros(3, 3, n);
 state.bodyRates = zeros(3, n);
-state.bodyTorques = zeros(3, n);
+state.bodyRateDots = zeros(3, n);   % 速率环给出的机体角加速度 Ω̇_i（见下方说明）
 for i = 1:n
     state.rotations(:, :, i) = projectSO3(cfg.initial.vehicleR(:, :, i));
     state.bodyRates(:, i) = cfg.initial.bodyRates(:, i);
@@ -94,12 +94,8 @@ if cfg.takeoff.enabled
     actualThrust = zeros(1, n);
 end
 
-% 控制器跨步状态
-memory = struct();
-memory.positionIntegral = zeros(3, 1);
-memory.linkIntegrals = zeros(3, n);
-memory.previousLinkUnits = [];
-memory.independentPositionIntegral = zeros(3, n);
+% 控制器跨步状态（与"悬停平衡绳向探针"共用同一份初始化，见 emptyControllerMemory）
+memory = emptyControllerMemory(n, cfg);
 
 % 混合状态：独立起飞/收紧 -> 绷紧段 -> 独立释放/降落。
 if cfg.takeoff.enabled
@@ -201,7 +197,7 @@ sim.commandLog = repmat(emptyCommandLog(n), 1, nSteps);
 sim.tensionLog = zeros(n, nSteps);
 sim.thrustLog = zeros(n, nSteps);
 sim.thrustPctLog = zeros(n, nSteps);
-sim.momentLog = zeros(3, n, nSteps);
+sim.bodyRateDotLog = zeros(3, n, nSteps);
 sim.attitudeErrorLog = zeros(n, nSteps);
 sim.linkErrorLog = zeros(n, nSteps);
 sim.positionErrorLog = zeros(1, nSteps);
@@ -217,9 +213,6 @@ sim.loadBodyRateLog = zeros(3, nSteps);
 %   ★ 定高工况下 R0d ≡ cfg.target.R0（第一轴 = +x）⇒ 本日志**恒为 0**，
 %     这是正常数据、不是"没记录到"；画图时**不能**用 any(日志 ~= 0) 判有效
 %     （会把恒为 0 的合法数据误判成无数据，于是参考曲线不画）。
-%   ★ 必须在此记录，不能在可视化里事后重调 cfg.referenceFcn：匿名句柄的多输出
-%     调用在部分 MATLAB 版本会失败（顶部 callReferenceFunction 要 6→5→4→3
-%     逐级回退即为此），事后调用失败会**静默退化**成只画实际 yaw。
 sim.loadYawRefLog = zeros(1, nSteps);
 % 实际负载 yaw 与包角后的 yaw 跟踪误差
 sim.loadYawLog = zeros(1, nSteps);
@@ -322,14 +315,23 @@ for k = 1:nSteps
             actualThrust = min(max(actualThrust, 0), cfg.vehicle.maxTotalThrust);
             sim.thrustLog(:, k + 1) = actualThrust(:);
 
+            % -------- 角速度内环（Crazyflie 固件速率环）：指令 → 角加速度 --------
+            % ★★ 与 v2 同构的 **PI** 速率环（不是纯比例）：角速度指令到位后
+            %    积分项把稳态速率误差收干净。机体惯量不需要 —— 原来把角加速度包成
+            %    力矩 M_i = J_i·α + Ω×J_iΩ 再交给动力学解 Ω̇ = J_i⁻¹(M − Ω×J_iΩ)，
+            %    两者恰好抵消 ⇒ 等价于直接给角加速度。
+            %    姿态在下面用 expSO3 积分。
             for i = 1:n
                 rateError = command.omegaCommands(:, i) - state.bodyRates(:, i);
-                bodyRateDotCmd = cfg.rateLoop.bandwidth .* rateError;
-                Omegai = state.bodyRates(:, i);
-                moment = cfg.vehicle.inertia * bodyRateDotCmd ...
-                    + cross(Omegai, cfg.vehicle.inertia * Omegai);
-                state.bodyTorques(:, i) = moment;
-                sim.momentLog(:, i, k + 1) = moment;
+                memory.rateIntegral(:, i) = memory.rateIntegral(:, i) ...
+                    + dt * rateError;
+                memory.rateIntegral(:, i) = clampVector( ...
+                    memory.rateIntegral(:, i), ...
+                    -cfg.rateLoop.integralLimit, cfg.rateLoop.integralLimit);
+                state.bodyRateDots(:, i) = ...
+                    cfg.rateLoop.bandwidth .* rateError ...
+                    + cfg.rateLoop.integralGain .* memory.rateIntegral(:, i);
+                sim.bodyRateDotLog(:, i, k + 1) = state.bodyRateDots(:, i);
             end
 
             uActual = zeros(3, n);
@@ -352,11 +354,9 @@ for k = 1:nSteps
                         state.vehicleVelocity(3, i) = 0;
                     end
                 end
+                % 机体角速度直接由速率环的角加速度推进（无刚体惯量，见上面的说明）
                 state.bodyRates(:, i) = state.bodyRates(:, i) ...
-                    + dt * (cfg.vehicle.inertia \ ...
-                    (state.bodyTorques(:, i) ...
-                    - cross(state.bodyRates(:, i), ...
-                    cfg.vehicle.inertia * state.bodyRates(:, i))));
+                    + dt * state.bodyRateDots(:, i);
                 state.bodyRates(:, i) = clampVector(state.bodyRates(:, i), ...
                     -cfg.simulation.maxBodyRate, cfg.simulation.maxBodyRate);
                 state.rotations(:, :, i) = projectSO3(state.rotations(:, :, i) ...
@@ -446,9 +446,12 @@ for k = 1:nSteps
         desired.position = landingStartPosition + blend * dPosLand;
         desired.velocity = (blendDot / approachDuration) * dPosLand;
         desired.acceleration = (blendDDot / approachDuration^2) * dPosLand;
+        desired.jerk = (smoothStep5ThirdDerivative(sLanding) ...
+            / approachDuration^3) * dPosLand;
         desired.rotation = state.loadRotation;
         desired.bodyRate = zeros(3, 1);
         desired.bodyRateDot = zeros(3, 1);
+        desired.bodyRateDDot = zeros(3, 1);
     end
 
     % ★★ 起飞交接：先把张力建起来（参考**冻结**），再把参考按受限剖面抬到目标。
@@ -481,6 +484,7 @@ for k = 1:nSteps
             posTarget = desired.position;
             velTarget = desired.velocity;
             accTarget = desired.acceleration;
+            jerkTarget = desired.jerk;
             dPos = posTarget - tautStartPosition;
             dVel = velTarget - tautStartVelocity;
             desired.position     = tautStartPosition + refBlend * dPos;
@@ -488,6 +492,9 @@ for k = 1:nSteps
                 + (refBlendDot / liftT) * dPos + refBlend * dVel;
             desired.acceleration = (refBlendDDot / liftT^2) * dPos ...
                 + refBlend * accTarget;
+            desired.jerk = (smoothStep5ThirdDerivative(sLift) / liftT^3) * dPos ...
+                + (refBlendDDot / liftT^2) * velTarget ...
+                + (refBlendDot / liftT) * accTarget + refBlend * jerkTarget;
         end
     end
 
@@ -603,17 +610,19 @@ for k = 1:nSteps
     actualThrust = min(max(actualThrust, 0), cfg.vehicle.maxTotalThrust);
     sim.thrustLog(:, k + 1) = actualThrust(:);
 
-    % -------- 角速度内环：等效 Crazyflie 固件速率环（逐机独立） --------
-    % 一阶闭环等效：Omega_dot_i = K_i*(Omega_cmd_i - Omega_i)，
-    % 对应力矩 M_i = J_i*Omega_dot_i + Omega_i x J_i Omega_i
+    % -------- 角速度内环：Crazyflie 固件速率环（逐机独立） --------
+    % ★ 与 v2 同构的 **PI**：Omega_dot_i = bandwidth.*e_i + integralGain.*∫e_i，
+    %   e_i = Omega_cmd_i - Omega_i。只给角加速度，**不再包成力矩**
+    %   （机体惯量会与姿态方程里的叉乘项完全抵消，见 parameters.m 的推导）。
     for i = 1:n
         rateError = command.omegaCommands(:, i) - state.bodyRates(:, i);
-        bodyRateDotCmd = cfg.rateLoop.bandwidth .* rateError;
-        Omegai = state.bodyRates(:, i);
-        moment = cfg.vehicle.inertia * bodyRateDotCmd ...
-            + cross(Omegai, cfg.vehicle.inertia * Omegai);
-        state.bodyTorques(:, i) = moment;
-        sim.momentLog(:, i, k + 1) = moment;
+        memory.rateIntegral(:, i) = memory.rateIntegral(:, i) ...
+            + dt * rateError;
+        memory.rateIntegral(:, i) = clampVector(memory.rateIntegral(:, i), ...
+            -cfg.rateLoop.integralLimit, cfg.rateLoop.integralLimit);
+        state.bodyRateDots(:, i) = cfg.rateLoop.bandwidth .* rateError ...
+            + cfg.rateLoop.integralGain .* memory.rateIntegral(:, i);
+        sim.bodyRateDotLog(:, i, k + 1) = state.bodyRateDots(:, i);
     end
 
     % -------- 实际作用力：物理模型 -f_i R_i e3 --------
@@ -892,184 +901,34 @@ end
 
 % ======================================================================
 function desired = referenceState(t, cfg)
-% 读取静态目标或用户提供的轨迹函数。
-if isempty(cfg.referenceFcn)
-    desired.position = cfg.target.position;
-    desired.velocity = cfg.target.velocity;
-    desired.acceleration = cfg.target.acceleration;
-    desired.rotation = cfg.target.R0;
-    desired.bodyRate = cfg.reference.omegaD;
-    desired.bodyRateDot = cfg.reference.omegaDotD;
-else
-    [position, velocity, acceleration, rotation, bodyRate, bodyRateDot] = ...
-        callReferenceFunction(cfg.referenceFcn, t);
-    desired.position = position;
-    desired.velocity = velocity;
-    desired.acceleration = acceleration;
-    desired.rotation = rotation;
-    desired.bodyRate = bodyRate;
-    desired.bodyRateDot = bodyRateDot;
-end
+% 读取静态目标。本工程只有**定高**工况：目标是常量，所有导数通道都有确定取值。
+%
+% ★ 2026-10-03：这里原先还有"`cfg.referenceFcn` 非空则调用外部轨迹函数"的分支，
+%   连同 8/7/6/5/4/3 输出的多契约兼容层（`callReferenceFunction` 等）一起删掉了 ——
+%   八字轨迹只存在于另一个分支，本分支只做定高。
+%   交接抬升 / 下降段的**时变**参考由主循环里的 5 次多项式剖面覆盖（见调用处），
+%   它的 jerk 是解析算出来的，所以 analytic 前馈要的那两个量依然齐备。
+%   ⇒ 顺带说明：原来那段"analytic 必须有 jerk/bodyRateDDot"的严格检查也随之删除，
+%     因为它现在**不可能触发**（静态路径直接给 0，抬升/降落段覆盖成解析值）。
+desired.position = cfg.target.position;
+desired.velocity = cfg.target.velocity;
+desired.acceleration = cfg.target.acceleration;
+desired.rotation = cfg.target.R0;
+desired.bodyRate = cfg.reference.omegaD;
+desired.bodyRateDot = cfg.reference.omegaDotD;
+desired.jerk = zeros(3, 1);          % 静态目标 ⇒ 位置高阶导数恒为 0
+desired.bodyRateDDot = zeros(3, 1);  % 偏航锁定时负载期望角速度恒为 0，其导数亦然
+
 desired.position = desired.position(:);
 desired.velocity = desired.velocity(:);
 desired.acceleration = desired.acceleration(:);
 desired.rotation = projectSO3(desired.rotation);
 desired.bodyRate = desired.bodyRate(:);
 desired.bodyRateDot = desired.bodyRateDot(:);
+desired.jerk = desired.jerk(:);
+desired.bodyRateDDot = desired.bodyRateDDot(:);
 end
 
-function [position, velocity, acceleration, rotation, bodyRate, bodyRateDot] = ...
-    callReferenceFunction(referenceFcn, t)
-% 兼容三种轨迹函数契约：
-%   ① 数值多输出（6 / 5 / 4 / 3 个输出）
-%   ② 单输出 struct（含 position / velocity / acceleration / rotation 等字段）
-%   ③ 单输出位置向量（退化契约）
-%
-% ★★ 陷阱（曾经报"此类型的变量不支持使用点进行索引"）★★
-%   MATLAB 对**匿名函数句柄**执行 nargout() 恒返回 -1，因为输出个数"未知"。
-%   而 cfg.referenceFcn 正是匿名句柄 @(t) crazyflie_slung_reference(t, cfg)，
-%   所以实际走的是 nargout < 0 这条路径。旧版分派只写了 >= 6 / == 5 / == 4，
-%   -1 三个分支都不命中 → 掉进最后的 struct 分支 → 把数值向量当结构体取字段
-%   → 直接报错。（静态悬停工况走 cfg.referenceFcn = [] 的分支，
-%   所以这条路径此前从未被执行，一直潜伏到现在。）
-%
-%   ⇒ 必须**显式**处理 nargout < 0，见下面的 ① 分支。
-
-numberOfOutputs = nargout(referenceFcn);
-
-if numberOfOutputs < 0
-    % ① 匿名句柄：nargout 恒为 -1，只能逐级回退试探
-    [position, velocity, acceleration, rotation, bodyRate, bodyRateDot] = ...
-        callReferenceAnonymous(referenceFcn, t);
-    return
-end
-
-% ② nargout 已知：按确切个数精确分派
-bodyRate = zeros(3, 1);
-bodyRateDot = zeros(3, 1);
-if numberOfOutputs >= 6
-    [position, velocity, acceleration, rotation, bodyRate, bodyRateDot] = referenceFcn(t);
-    return
-end
-if numberOfOutputs == 5
-    [position, velocity, acceleration, rotation, bodyRate] = referenceFcn(t);
-    warnDegraded('5');
-    return
-end
-if numberOfOutputs == 4
-    [position, velocity, acceleration, rotation] = referenceFcn(t);
-    warnDegraded('4');
-    return
-end
-if numberOfOutputs == 3
-    [position, velocity, acceleration] = referenceFcn(t);
-    rotation = eye(3);
-    warnDegraded('3');
-    return
-end
-
-% ③ 其余（0~2 个输出）：单输出兜底
-[position, velocity, acceleration, rotation, bodyRate, bodyRateDot] = ...
-    callReferenceSingleOutput(referenceFcn, t, []);
-end
-
-function [position, velocity, acceleration, rotation, bodyRate, bodyRateDot] = ...
-    callReferenceAnonymous(referenceFcn, t)
-% 匿名句柄专用：nargout == -1，无法预知输出个数，只能逐级回退试探
-% 6 → 5 → 4 → 3 个输出，全失败则按单输出解释。
-%
-% 记下**第一个**错误：若连单输出也失败，就把原始报错抛出去，
-% 免得把参考函数内部的真实 bug（维度不符等）伪装成"只返回位置"而静默降级。
-bodyRate = zeros(3, 1);
-bodyRateDot = zeros(3, 1);
-firstError = [];
-try
-    [position, velocity, acceleration, rotation, bodyRate, bodyRateDot] = referenceFcn(t);
-    return
-catch err
-    firstError = err;
-end
-try
-    [position, velocity, acceleration, rotation, bodyRate] = referenceFcn(t);
-    warnDegraded('5');
-    return
-catch
-end
-try
-    [position, velocity, acceleration, rotation] = referenceFcn(t);
-    warnDegraded('4');
-    return
-catch
-end
-try
-    [position, velocity, acceleration] = referenceFcn(t);
-    rotation = eye(3);
-    warnDegraded('3');
-    return
-catch
-end
-[position, velocity, acceleration, rotation, bodyRate, bodyRateDot] = ...
-    callReferenceSingleOutput(referenceFcn, t, firstError);
-end
-
-function [position, velocity, acceleration, rotation, bodyRate, bodyRateDot] = ...
-    callReferenceSingleOutput(referenceFcn, t, firstError)
-% 单输出兜底：struct 则读字段，数值则当作位置向量。
-bodyRate = zeros(3, 1);
-bodyRateDot = zeros(3, 1);
-data = [];
-try
-    data = referenceFcn(t);
-catch
-    if ~isempty(firstError)
-        rethrow(firstError);      % 抛**原始**报错，保留真实病因
-    end
-    error('crazyflie_slung:referenceFcnUncallable', ...
-        'referenceFcn 无法以任何已知契约调用。');
-end
-if isstruct(data)
-    position = data.position;
-    velocity = data.velocity;
-    acceleration = data.acceleration;
-    rotation = data.rotation;
-    bodyRate = getFieldOr(data, 'bodyRate', zeros(3, 1));
-    bodyRateDot = getFieldOr(data, 'bodyRateDot', zeros(3, 1));
-    if ~isfield(data, 'bodyRate') || ~isfield(data, 'bodyRateDot')
-        warnDegraded('struct');
-    end
-else
-    position = data;
-    velocity = zeros(3, 1);
-    acceleration = zeros(3, 1);
-    rotation = eye(3);
-    warnDegraded('1');
-end
-end
-
-function warnDegraded(kind)
-% 参考函数只提供了部分输出时，一次性提示"哪些量被默认值顶替了"。
-% 只警告一次，否则 12500 个积分步会刷满命令窗口。
-persistent firedKinds
-if isempty(firedKinds)
-    firedKinds = {};
-end
-if any(strcmp(firedKinds, kind))
-    return
-end
-firedKinds{end + 1} = kind;
-warning('crazyflie_slung:referenceFcnDegraded', ...
-    ['referenceFcn 只提供了 %s 个输出的契约，未提供的量已用默认值补齐' ...
-     '（姿态=单位阵 / 体角速度与角加速度=0）。' ...
-     '若这不是本意，请检查轨迹函数的输出个数。'], kind);
-end
-
-function value = getFieldOr(s, name, fallback)
-if isfield(s, name)
-    value = s.(name);
-else
-    value = fallback;
-end
-end
 
 % ======================================================================
 % 日志辅助
@@ -1329,110 +1188,6 @@ else
     summary.onsetStep = nan;
 end
 
-% -------- 绕八字避障工况的专项指标 --------
-% ★ 三阶段的窗口划分与 cfg.figureEight 完全一致。
-%   环绕段（cruise）是"跟踪精度"真正该考核的窗口：起飞/降落段本身就带
-%   大范围机动，把它们混进来会把指标稀释得看不出问题。
-%   所以把误差统计拆成 起飞 / 环绕 / 降落 三段分别记录。
-if isfield(cfg, 'figureEight') && ~isempty(cfg.figureEight)
-    fe = cfg.figureEight;
-    t1 = fe.takeoffDuration;
-    t2 = t1 + fe.cruiseDuration;
-    t3 = t2 + fe.landingDuration;
-    idxTakeoff = [1, max(2, round(t1 / cfg.simulation.dt))];
-    idxCruise = [max(1, round(t1 / cfg.simulation.dt)), ...
-                 min(nSteps, round(t2 / cfg.simulation.dt))];
-    idxLanding = [min(nSteps, round(t2 / cfg.simulation.dt)), nSteps];
-    pe = sim.positionErrorLog;
-
-    summary.phaseWindows = [idxTakeoff; idxCruise; idxLanding];
-    summary.maxPositionErrorTakeoff = max(pe(idxTakeoff(1):idxTakeoff(2)));
-    summary.maxPositionErrorCruise = max(pe(idxCruise(1):idxCruise(2)));
-    summary.meanPositionErrorCruise = mean(pe(idxCruise(1):idxCruise(2)));
-    summary.maxPositionErrorLanding = max(pe(idxLanding(1):idxLanding(2)));
-    % 降落完成后负载到落点的残差（真正的"能不能停住"指标）
-    summary.landingPointError = norm(loadPosition(:, end) - fe.landPosition);
-    % 环绕段是"八字"而不是别的路径的判据：x 方向必须完成 2*cycles 次往复
-    summary.figureEightCycles = fe.cycles;
-    summary.trajectorySpan = [max(loadPosition(1, :)) - min(loadPosition(1, :)); ...
-                              max(loadPosition(2, :)) - min(loadPosition(2, :))];
-    summary.durationPhases = [t1, t2, t3];
-else
-    summary.phaseWindows = [];
-end
-
-% -------- 锥形障碍物间隙自检 --------
-% ★ 论文 Fig. 3 明确要求"around two obstacles represented by cones"，
-%   因此"负载是否始终避开锥"是本工况的正确性条件，必须量化守住。
-%   判据：负载外接球心到锥轴的**水平**距离，减去锥在该高度处的半径，
-%         再减去负载外接球半径，得到净间隙；要求 > cfg.obstacles.clearance。
-%   为什么用水平距离而不是三维点面距离：锥是竖直放置的回转体，
-%   它的外表面完全由"到轴线的水平距离 r(z)"描述，这样算最直接。
-%
-% ★★ 高度定义（这里曾经出过一个把整个自检废掉的错误）★★
-%   统一用"离地高度"这一个量，避免 baseZ 的符号反复绕：
-%       hGround = -loadPosition(3,:)          % z 向下为正，取负即离地高度
-%   锥体占据的高度区间是 [hBase, hBase + height]，其中
-%       hBase = -cfg.obstacles.baseZ          % 锥底离地高度
-%   负载高度落在区间内才比较；高于锥顶则不可能碰撞（gap = inf）。
-%   ★ 旧代码写成 hAboveBase = (baseZ - z) + height，再与 height 比，
-%     语义混乱：baseZ 为负、height 为正时，实际量是 "离锥顶的距离" 而不是
-%     "离锥底的高度"。当锥长期位于负载平面以下时它恒 > height，
-%     于是整条轨迹都走 inf 分支、自检恒 PASS。现在改成单一物理量。
-hBase = -cfg.obstacles.baseZ;          % 锥底离地高度 [m]
-hGround = -loadPosition(3, :);         % 负载离地高度 [m]
-if isfield(cfg, 'obstacles') && isfield(cfg.obstacles, 'enabled') ...
-        && cfg.obstacles.enabled
-    payloadRadius = 0.5 * norm(cfg.payload.size);   % 外接球半径
-    nObs = size(cfg.obstacles.positions, 2);
-    minClearance = inf;
-    minClearanceTime = 0;
-    % 诊断：统计各分支被走的次数，防止"恒走 inf 分支"这类静默失效
-    nObsInside = 0;
-    nObsAbove = 0;
-    nObsBelow = 0;
-    for k = 1:nSteps
-        for j = 1:nObs
-            dx = loadPosition(1, k) - cfg.obstacles.positions(1, j);
-            dy = loadPosition(2, k) - cfg.obstacles.positions(2, j);
-            rHoriz = hypot(dx, dy);
-            hLocal = hGround(k) - hBase;          % 相对锥底的高度
-            % 只在锥的高度范围内检查；越顶或未进入锥区则间隙视为很大
-            if hLocal >= 0 && hLocal <= cfg.obstacles.height
-                radiusHere = cfg.obstacles.radius ...
-                    * (1 - hLocal / cfg.obstacles.height);
-                gap = rHoriz - radiusHere - payloadRadius;
-                nObsInside = nObsInside + 1;
-            elseif hLocal > cfg.obstacles.height
-                gap = inf;    % 负载在锥顶以上，不可能碰撞
-                nObsAbove = nObsAbove + 1;
-            else
-                gap = rHoriz - cfg.obstacles.radius - payloadRadius;
-                nObsBelow = nObsBelow + 1;
-            end
-            if gap < minClearance
-                minClearance = gap;
-                minClearanceTime = sim.time(k);
-            end
-        end
-    end
-    summary.minObstacleClearance = minClearance;
-    summary.minObstacleClearanceTime = minClearanceTime;
-    summary.obstacleBranchCounts = [nObsInside, nObsAbove, nObsBelow];
-    % ★ 有效性门控：若"在锥高度区间内"的采样点数为 0，说明避障根本没被检查过，
-    %   此时即便 minClearance 是有限值也毫无意义，必须判定为无效（false）。
-    summary.obstacleClearanceValid = (nObsInside > 0);
-    summary.obstacleClearanceOk = summary.obstacleClearanceValid ...
-        && (minClearance > cfg.obstacles.clearance);
-    summary.payloadBoundingRadius = payloadRadius;
-else
-    summary.minObstacleClearance = inf;
-    summary.minObstacleClearanceTime = 0;
-    summary.obstacleBranchCounts = [0, 0, 0];
-    summary.obstacleClearanceValid = true;
-    summary.obstacleClearanceOk = true;
-    summary.payloadBoundingRadius = 0.5 * norm(cfg.payload.size);
-end
 
 % 悬停张力由当前挂点几何决定，而不是固定的 m0*g/n。
 % 对竖直绳索，sum(mu_i) = -m0*g*e3 且 sum(rho_i x mu_i) = 0，
@@ -1570,12 +1325,18 @@ desired.acceleration = zeros(3, 1);
 desired.rotation = state.loadRotation;
 desired.bodyRate = zeros(3, 1);
 desired.bodyRateDot = zeros(3, 1);
-% 一次性 memory 副本：绝不污染真实的跨步积分器/差分状态
-probe = struct();
-probe.positionIntegral = zeros(3, 1);
-probe.linkIntegrals = zeros(3, n);
-probe.previousLinkUnits = cfg.initial.linkUnits;
-probe.independentPositionIntegral = zeros(3, n);
+% ★★ 悬停平衡是**静态**构型 ⇒ 三阶导数与负载角加速度的导数都是 0。
+%   但控制器的 analytic 前馈链（analyticForceCommandDerivative）**要求这两个字段存在**，
+%   缺了就直接 error ⇒ 探针失败 ⇒ 收紧段退回 groundRadialOffset 几何 ⇒
+%   交接瞬间绳向阶跃回到 30°+（本函数存在的意义就是为了消掉它）。
+%   ✗ 曾经这里只填了 position/velocity/acceleration/rotation/bodyRate/bodyRateDot，
+%     ⇒ 一运行就报"求悬停平衡绳向失败"。
+desired.jerk = zeros(3, 1);
+desired.bodyRateDDot = zeros(3, 1);
+% 一次性 memory 副本：**与仿真主循环共用同一份初始化**。
+% ✗ 原来这里只手填了 4 个字段，而控制器实际用到 16 个 —— 每给控制器加一个
+%   memory 字段，探针就会先漏掉它（症状同上：静默退回 groundRadialOffset）。
+probe = emptyControllerMemory(n, cfg);
 try
     command = crazyflie_slung_controller(state, desired, probe, cfg);
     qInertial = command.desiredLinkUnits;
@@ -1590,6 +1351,48 @@ catch err
         ['求悬停平衡绳向失败（%s）⇒ 收紧段退回 groundRadialOffset 几何，' ...
          '交接瞬间会有较大的绳向阶跃（实测可达 36°）。'], err.message);
 end
+end
+
+% ======================================================================
+function memory = emptyControllerMemory(n, cfg)
+%EMPTYCONTROLLERMEMORY 控制器跨步状态的一份**干净副本**。
+%
+% ★★ 为什么要抽成函数：仿真主循环和 equilibriumLinkUnitsBody 的"悬停平衡探针"
+%    都需要一份全新的 memory。**探针原来只手填了 4 个字段，而控制器实际用到 16 个**，
+%    于是每给控制器新增一个 memory 字段、探针就会先漏掉它：调用直接报错 ⇒
+%    catch 到 ⇒ 收紧段静默退回 groundRadialOffset 几何 ⇒ 交接瞬间绳向阶跃回到 30°+
+%    （而这个探针存在的唯一目的就是消掉那个阶跃）。
+%    ⇒ 两边**共用同一份初始化**，以后加字段只会加一次，不会再漂移。
+%
+% ★ 字段清单必须与 crazyflie_slung_controller.m 里所有 `memory.*` 的用法一一对应。
+%   加新字段时两边一起改；`_verify_python/_lint_matlab.py` 的"字段检查"可以发现
+%   控制器读了但这里没初始化的名字。
+memory = struct();
+% --- 位置环与绳向环 ---
+memory.positionIntegral = zeros(3, 1);
+memory.linkIntegrals = zeros(3, n);
+% 用初始绳向而不是 []：控制器在 mu_id 退化（norm < eps）时会回退到它，
+% 给 [] 会在那种情况下直接索引越界。
+memory.previousLinkUnits = cfg.initial.linkUnits;
+% --- 独立起飞/降落控制器 ---
+memory.independentPositionIntegral = zeros(3, n);
+% --- 速率环积分器（PI 的 I 部分，见 cfg.rateLoop）---
+memory.rateIntegral = zeros(3, n);
+% --- 姿态外环：前馈（Omega_ic 的来源）与可选积分器，见 cfg.attitudeController ---
+memory.previousVehicleRc = zeros(3, 3, n);
+memory.previousVehicleU = zeros(3, n);
+memory.feedforwardRate = zeros(3, n);
+memory.attitudeIntegral = zeros(3, n);
+memory.feedforwardStarted = false;
+% --- 指令滤波与高增益观测器（analytic omegaC 的辅助状态）---
+memory.filteredVehicleU = zeros(3, n);
+memory.filteredVehicleUDot = zeros(3, n);
+memory.commandFilterStarted = false(1, n);
+memory.analyticForceCommandDot = zeros(3, n);
+memory.analyticForceCommandDotValid = false;
+memory.highGainVehicleU = zeros(3, n);
+memory.highGainVehicleUDot = zeros(3, n);
+memory.highGainObserverStarted = false(1, n);
 end
 
 function [distance, slack, qAll, qdAll] = ropeGeometryFromVehicles(state, cfg)
@@ -1653,13 +1456,19 @@ value = min(max(value, 0), 1);
 value = value.^3 .* (10 - 15 * value + 6 * value.^2);
 end
 
-function [value, firstDerivative, secondDerivative] = ...
+function [value, firstDerivative, secondDerivative, thirdDerivative] = ...
     smoothStep5WithDerivatives(value)
-% 五次 smoothstep 及其对无量纲参数的前两阶导数。
+% 五次 smoothstep 及其对无量纲参数的前三阶导数。
 value = min(max(value, 0), 1);
 firstDerivative = 30 * value.^2 .* (1 - value).^2;
 secondDerivative = 60 * value .* (1 - value) .* (1 - 2 * value);
+thirdDerivative = 60 - 360 * value + 360 * value.^2;
 value = value.^3 .* (10 - 15 * value + 6 * value.^2);
+end
+
+function value = smoothStep5ThirdDerivative(value)
+value = min(max(value, 0), 1);
+value = 60 - 360 * value + 360 * value.^2;
 end
 
 function halfHeight = payloadGroundHalfHeight(R, sizeXYZ)

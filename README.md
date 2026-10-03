@@ -40,9 +40,8 @@ report = crazyflie_slung_demo();         % 完整仿真、自检和可视化
 | `crazyflie_slung_parameters.m` | 默认参数、负载尺寸派生量和合法性检查 |
 | `crazyflie_slung_controller.m` | 负载位置/yaw 外环、张力分配、绳向控制、推力和机体姿态指令 |
 | `crazyflie_slung_independent_controller.m` | 松弛绳阶段的单机几何 PID 起飞/降落控制器（参考 v2） |
-| `crazyflie_slung_dynamics.m` | 负载、绳索和无人机动力学 |
+| `crazyflie_slung_dynamics.m` | 负载与绳索动力学；四旋翼姿态由速率环给出（不做刚体建模，见下）|
 | `crazyflie_slung_simulation.m` | 执行器等效模型、积分、日志和碰撞诊断 |
-| `crazyflie_slung_reference.m` | 静态目标或八字轨迹参考 |
 | `crazyflie_slung_demo.m` | 一键仿真和自检报告 |
 | `crazyflie_slung_visualization.m` | 轨迹、负载、无人机和缆绳可视化 |
 | `crazyflie_slung_diagnose.m` | 发散起点和数值异常定位 |
@@ -50,6 +49,95 @@ report = crazyflie_slung_demo();         % 完整仿真、自检和可视化
 | `README_local.md` | 本 README 的**带公式版**（保留 LaTeX）。用 Typora / VS Code / Obsidian 本地阅读时看它；**在 GitHub 网页上它的公式会显示成美元符号原文**，网页阅读请用本文件 |
 | `.gitignore` | 忽略 MATLAB 自动保存文件等（`*.asv` 等） |
 | `ENGINEERING_LOG.md` | 公式、修改原因和调参记录 |
+
+### 绘图输出
+
+运行 `crazyflie_slung_demo()`（`cfg.visualization.plot = true`）会输出下面几张图：
+
+| 图名 | 内容 |
+|---|---|
+| 多机协同吊运仿真结果 | 6 个子图：三维轨迹 / 负载位置误差 / 绳向误差 / 高度（负载 vs 各机）/ 张力与推力占比 / 负载偏航角 |
+| 绳索状态与起降阶段 | 绳长余量 `l-d_i`、阶段编码与张力软启动比例（仅 `takeoff.enabled` 时出现）|
+| 四旋翼机体姿态角 | 3 个子图：各架四旋翼的 **roll / pitch / yaw** 随时间变化，n 架 ⇒ 3n 条曲线 |
+| 多机协同吊运三维动画 | 机体 + 四臂 + 旋翼 + 绳索 + 长方体负载（仅 `cfg.visualization.animate` 时出现）|
+
+> 机体姿态角由 `sim.rotationLog` 的旋转矩阵按 **ZYX 欧拉角**反解
+> （与 `parameters.m` 的 `rpyToRotm` 同一约定）；yaw 做了相位解卷绕，否则
+> 跨 ±180° 会出现竖直线。这张图是**各机机体**的姿态，
+> 与第 6 个子图的**负载偏航角**不是同一个量。
+
+## 四旋翼模型：推力 + 角速度内环（不做刚体姿态建模）
+
+与 v2（`crazyflie_ctbr_simulation.m`）一致，**本工程不对四旋翼做六自由度刚体建模**。
+
+**① 推力 = "指令力在实际机体轴上的投影"**
+控制器算出的是每台机应施加的合力 `u_i^cmd = u_i^∥ + u_i^⊥`（平行分量 + 垂直分量），
+而四旋翼只能沿**自己的机体 z 轴**出力，所以推力取投影：
+
+```text
+f_i = -(u_i^cmd)' · R_i · e_3          R_i 是**实际**姿态，不是期望姿态
+```
+
+再经一阶执行器（`vehicle.thrustTimeConstant`）、饱和到 `vehicle.maxTotalThrust`，
+实际作用力为 `-f_i · R_i e_3`。只有当姿态收敛到期望姿态 `R_ic` 时才趋近 `u_i^cmd`。
+
+**② 姿态 / 角速度：只用速率环，不用机体惯量**
+控制器从**同一个** `u_i^cmd` 得到期望姿态 `R_ic`，再由姿态误差给出**角速度指令**
+`Ω_cmd,i`（对应 cflib 的 `send_setpoint(..., rate=True)`）。机体姿态由固件速率环的
+一阶闭环直接推进：
+
+```text
+Ω̇_i = rateLoop.bandwidth .* (Ω_cmd,i − Ω_i)
+R_i ← R_i · exp(hat(Ω_i)·dt)
+```
+
+**为什么不需要机体惯量**（可以自己验算）：若把速率环的角加速度包成力矩
+`M_i = J_i·α + Ω_i × J_i Ω_i`，再代回姿态方程 `Ω̇_i = J_i⁻¹(M_i − Ω_i × J_i Ω_i)`，
+`J_i` 与叉乘项**完全抵消**，恒等于 `Ω̇_i = α`。
+数值验证见 `v3/_verify_python/_test_vehicle_rate_model.py`：2000 组随机状态下
+新旧两种写法最大差 **1.4e-14 rad/s²**。
+
+⇒ 因此 `cfg.vehicle` 里**没有** `inertia`。物理参数只剩影响平动与执行器的
+`mass` / `gravity` / `maxTotalThrust` / `thrustTimeConstant`，
+以及仅供三维显示与碰撞半径使用的 `armLength` / `rotorRadius` / `bodySize` / `rotorSpinHz`。
+
+> ★★ **与 v2 的对比（2026-10-03：外层前馈 + 内环 PI，`useRateDamping=false` 默认）**
+>
+> 控制律已按 v2 写成同一形式：
+>
+> ```text
+> Omega_cmd_i = R_i'R_ic·Omega_ic − kR_i·e_Ri − kIR_i·∫e_Ri        （外层）
+> Omega_dot_i = bandwidth_i·e_Ωi + integralGain_i·∫e_Ωi            （内环，PI）
+> ```
+>
+> | | 本工程 | v2 |
+> |---|---|---|
+> | 外层律 | 上式（`useRateDamping = false` 默认）| 同一形式 —— **一致** |
+> | 外层积分 | 有开关（`useIntegral`），默认**关** | 有开关，默认**关** —— 一致 |
+> | 内环 | **PI** | **PI** —— 结构一致 |
+> | 前馈 `Ω_ic` 算法 | `omegaCMethod` 可选 `'analytic'`（默认，完整控制链解析求导）、`'filtered_log_difference'`（SO(3) 对数差分）、`'command_filter'`（二阶命令滤波并直接取得导数）、`'high_gain_observer'`（高增益非线性微分器）| `'analytic'`（默认，同左）或 `'log_difference'` |
+> | 前馈的**种子** | `u_i^cmd` 按 `Fd/Md → μ_id → q_id → a_i → u_i^cmd` 逐层解析求导 | `A_dot` **解析**（位置环输出可直接求导）|
+> | 前馈保护 | 限幅 `feedforwardMaxRate = 20 rad/s` + 一阶低通 `feedforwardFilterTime = 0.02 s` | 无（解析种子不需要）|
+> | 可选速率阻尼 `−kOmega·e_Ω` | 开关 `useRateDamping`，**默认 false = v2** | 无此项 |
+> | 内环附加限幅 | 角速度 `±simulation.maxBodyRate` | **力矩** `±maxMoment`（等效限制角加速度）|
+>
+> ★ **哪种前馈算法需要参考的解析导数**：**只有 `'analytic'` 需要** `desired.jerk` 与
+> `desired.bodyRateDDot`，其余四种都不需要。本分支（定高）这两个量由
+> `referenceState()` 直接给出 —— 静态目标 ⇒ 全 0；抬升 / 降落段由 5 次多项式剖面
+> **解析**给出 jerk ⇒ 所以**默认的 `'analytic'` 可以直接用**。
+> （历史说明：八字分支的参考在**非锁 yaw 巡航段**曾返回 `bodyRateDDot = []`，
+> 那里才需要改用 `'command_filter'` / `'high_gain_observer'`；本分支已无此问题。）
+>
+> **⇒ 结构已与 v2 一致，剩下的实质差异只有增益**（本工程 `kR` 是 v2 的 80 倍、
+> `bandwidth` 是 3.5 倍；积分增益与限幅**取了 v2 的值**）。
+>
+> ★ 前馈为什么要限幅 + 低通：前馈的种子（`u_i^cmd` 的变化）含分配/绳向环的高频抖动，
+> 裸的 `1/dt` 差分会放大成每秒几百弧度的假前馈。本项目实测过该自激，所以历史上把前馈
+> 整项置零。开关：`omegaCMethod = 'none'` 关掉前馈；`true/false` 切 `useRateDamping`。
+> ★★ **积分时间常数 = 比例增益 / 积分增益 = 35/3 ≈ 11.7 s**，而仿真只有 30 s
+> ⇒ **默认的 I 项几乎来不及起作用**。要让 I 生效，把 `rateLoop.integralGain` 调到 10~20。
+> 数值验证见 `v3/_verify_python/_test_rate_pi_feedforward.py`。
+
 
 ## 修改负载尺寸
 
@@ -296,8 +384,9 @@ SLACK -> TAKEUP -> TAUT_RAMP -> ACTIVE
 ```
 
 > **命名提醒**：状态机里第三段的名字是 `ACTIVE`（见 `crazyflie_slung_simulation.m`
-> 末尾 `modeCode` 的 `case`）。README 早期几版、`ENGINEERING_LOG.md` 和可视化图例
-> 里写作 `TAUT_ACTIVE`，那只是叫法。**代码里 `strcmp(mode, ...)` 必须用 `'ACTIVE'`** ——
+> 末尾 `modeCode` 的 `case`）。README 早期几版与 `ENGINEERING_LOG.md` 里写作
+> `TAUT_ACTIVE`，那只是叫法（可视化图例里原先也这么写，已一并改成 `ACTIVE`）。
+> **代码里 `strcmp(mode, ...)` 必须用 `'ACTIVE'`** ——
 > 写错不会报错，只会让那个分支永远不命中（本项目为此踩过一次，见下）。
 
 - `SLACK`：负载底面接触地面，三架无人机使用独立几何 PID 飞到安全高度；绳索长度由实际无人机位置计算，张力为 0。

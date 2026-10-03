@@ -6,13 +6,10 @@ function report = crazyflie_slung_demo(options)
 %   crazyflie_slung_demo("quick");          % 只跑自检，不画图（缩短时长）
 %   report = crazyflie_slung_demo();        % 取回自检报告结构体
 %
-% ★ 默认工况是**绕八字避障**（对应论文 Lee 2018 Fig. 3）：
-%     阶段 0  起飞    t ∈ [0, 3)    竖直爬升到环绕平面
-%     阶段 1  环绕    t ∈ [3, 21)   绕两个完整八字，横宽 ±1.5 m，绕开两个锥
-%     阶段 2  降落    t ∈ [21, 25]  水平归位 + 竖直下降到落点
-%   在参数文件里清空 cfg.referenceFcn 可退回静态悬停工况。
-%   自检因此分两组：**通用组**（动力学/绳约束/分配一致性）两组工况都适用，
-%   **八字组**（跟踪精度/避障间隙/三阶段指标）只在八字工况下检查。
+% ★ 本分支的工况是**定高悬停**（对应论文 Lee 2014/2018 的静态位姿保持）：
+%     负载从地面被三机吊起、收紧绳、抬到目标高度 -0.35 m，然后保持悬停。
+%   期望参考就是常量目标点 cfg.target（没有外部轨迹函数）；
+%   抬升段与末段下降的时变参考由仿真主程序自己用 5 次多项式剖面生成。
 %
 % 自检项的物理依据：
 %   * 张力分配一致性 —— 论文 (22) 要求 sum_i mu_id = Fd 且 sum_i hat(rho_i) R0' mu_id = Md。
@@ -25,11 +22,6 @@ function report = crazyflie_slung_demo(options)
 %   * 负载姿态误差**按轴分开判定**：roll/pitch 是高带宽可控轴，yaw 是低带宽
 %     可控轴，分别检查姿态跟踪误差和角速度有界性。
 %   * 偏航漂移率有界 —— 负载 yaw 角速度在演示窗口内不得失控。
-%   * 【八字组】三阶段跟踪误差 —— 起飞/环绕/降落分别设门限。环绕段是
-%     "跟踪精度"真正该考核的窗口；门限按 ±1.5 m 大尺度机动的实测值设定
-%     （见 README §10 的调参记录），不是拍脑袋的数字。
-%   * 【八字组】负载到两个锥形障碍物的净间隙 —— 对应论文 Fig. 3 的
-%     "around two obstacles represented by cones"，是本工况的正确性条件。
 
 if nargin < 1 || isempty(options)
     options = "full";
@@ -41,27 +33,11 @@ fprintf(' 多机协同吊运仿真（Lee 2014/2018 框架）  —  一键自检\
 fprintf('==============================================================\n\n');
 
 cfg = crazyflie_slung_parameters();
-isFigureEight = ~isempty(cfg.referenceFcn) && isfield(cfg, 'figureEight');
 if quickMode
     cfg.visualization.plot = false;
     cfg.visualization.animate = false;
-    if isFigureEight
-        % 八字工况的时长是三阶段之和，收紧 quick 模式会破坏阶段划分，
-        % 因此这里只把总时长按比例缩到 2 s 留作极快的"冒烟测试"，
-        % 但保留三阶段结构（起飞/环绕/降落各按比例缩）。
-        % ★ 必须按**当前**三阶段时长等比缩放，不能硬编码。
-        %   曾经写死 3.0 / 18.0 / 4.0，cruiseDuration 改成 45 后这套比例就错了。
-        total = cfg.simulation.duration;
-        cfg.figureEight.takeoffDuration = cfg.figureEight.takeoffDuration / total * 2.0;
-        cfg.figureEight.cruiseDuration = cfg.figureEight.cruiseDuration / total * 2.0;
-        cfg.figureEight.landingDuration = cfg.figureEight.landingDuration / total * 2.0;
-        cfg.figureEight.blendTime = min(cfg.figureEight.blendTime, ...
-            cfg.figureEight.cruiseDuration / 3);
-        cfg.simulation.duration = 2.0;
-        cfg.referenceFcn = @(t) crazyflie_slung_reference(t, cfg);
-    else
-        cfg.simulation.duration = 12.0;
-    end
+    % 本分支只有定高工况（没有外部轨迹函数），quick 模式只需缩短总时长。
+    cfg.simulation.duration = 12.0;
     fprintf('[模式] quick：不绘图，时长 %.1f s\n\n', cfg.simulation.duration);
 end
 
@@ -125,27 +101,6 @@ fprintf('  最大悬停推力占比        : %.1f %% 上限\n', 100 * max(thrHov
 fprintf('  总悬停推力              : %.4f N / 可用 %.4f N\n', ...
     sum(thrHoverCfg), n * tMax);
 fprintf('  推重比                  : %.2f\n', n * tMax / ((m0 + n * m) * g));
-if isFigureEight
-    fe = cfg.figureEight;
-    fprintf('\n--- 八字避障工况（论文 Fig. 3 算例 / Fig. 2 快照）---\n');
-    fprintf('  八字横宽 x              : ±%.2f m（半宽 %.2f m）\n', fe.amplitudeX, fe.amplitudeX);
-    fprintf('  八字纵长 y              : ±%.2f m（半长 %.2f m）\n', ...
-        0.5 * fe.amplitudeY, 0.5 * fe.amplitudeY);
-    fprintf('  环绕圈数                : %.1f 个完整八字\n', fe.cycles);
-    fprintf('  三阶段时长              : 起飞 %.1f s + 环绕 %.1f s + 降落 %.1f s = %.1f s\n', ...
-        fe.takeoffDuration, fe.cruiseDuration, fe.landingDuration, cfg.simulation.duration);
-    fprintf('  包络过渡时长 blendTime  : %.1f s（★ 必须 >= 5 s，见下）\n', fe.blendTime);
-    fprintf('  环绕平面高度            : %.2f m\n', -fe.cruiseHeight);
-    if cfg.obstacles.enabled
-        fprintf('  锥形障碍物 %d 个        : ', size(cfg.obstacles.positions, 2));
-        for j = 1:size(cfg.obstacles.positions, 2)
-            fprintf('(%.2f, %.2f) ', cfg.obstacles.positions(1, j), cfg.obstacles.positions(2, j));
-        end
-        fprintf('\n');
-        fprintf('    锥高 %.2f m，底半径 %.2f m，要求净间隙 > %.2f m\n', ...
-            cfg.obstacles.height, cfg.obstacles.radius, cfg.obstacles.clearance);
-    end
-end
 fprintf('\n');
 
 % ---------------------------------------------------------------- 仿真
@@ -285,26 +240,10 @@ end
 %   这时改用下面【八字组】的三阶段门限来判定。
 %   如果把 2 cm 硬套到八字工况，会得到一个"永远 FAIL"的假告警，
 %   反而掩盖真正的跟踪问题。
-if ~isFigureEight
-    checks = addCheck(checks, '稳态位置误差 < 2 cm', s.steadyPositionError < 0.02, ...
-        sprintf('%.4f m (%.2f mm)', s.steadyPositionError, 1000*s.steadyPositionError), ...
-        '< 0.02 m');
+checks = addCheck(checks, '稳态位置误差 < 2 cm', s.steadyPositionError < 0.02, ...
+    sprintf('%.4f m (%.2f mm)', s.steadyPositionError, 1000*s.steadyPositionError), ...
+    '< 0.02 m');
 
-    % ★★ 配置一致性：**定高工况不应启用锥形障碍物**。
-    %   理由：锥体的存在意义是"负载水平绕行时必须避开"，而定高悬停根本不做水平运动
-    %   ⇒ 锥体既无物理意义，又会污染三维图与自检输出（曾出现"定高工况还画着两个锥"）。
-    %   ★ 注意锥体只参与可视化与自检、**不进入动力学**，所以这条只是配置一致性断言，
-    %     关闭它对全部动力学指标零影响。
-    checks = addCheck(checks, '定高工况未启用锥形障碍物（无反意义务）', ...
-        ~cfg.obstacles.enabled, ...
-        sprintf('obstacles.enabled = %d（定高工况应为 0）', cfg.obstacles.enabled), ...
-        '= false');
-    if cfg.obstacles.enabled
-        warning('crazyflie_slung_demo:ObstaclesInHoverCase', ...
-            ['当前为**静态悬停**工况（cfg.referenceFcn 为空），但 cfg.obstacles.enabled = true。' ...
-             '锥形障碍物在定高工况下没有意义，建议置 false —— 三维图与自检会更干净。']);
-    end
-end
 % ★ 绳向误差的门限必须考虑**偏航漂移的注入**。
 %   实测（_scan_ki_3drone.py）：绳向误差在 24~30 s 窗口内已到 2.0 deg 附近，
 %   而且它并非收敛到一个常值，而是随偏航角漂移缓慢增长
@@ -368,115 +307,11 @@ checks = addCheck(checks, '最大机体角速度 < 8 rad/s', s.maxBodyRate < 8, 
 
 target = cfg.target.position(:);
 finalPos = s.loadPositionFinal(:);
-if isFigureEight
-    % 八字工况的终点是 cfg.figureEight.landPosition（= target.position），
-    % 而且它经过了完整的起飞/环绕/降落三段，所以门限要放宽：
-    % 降落段本身只有 4 s，从巡航误差里恢复需要时间。
-    % 实测（KX=14, KI=3.0, B=6.0）：末点残差 78.7 mm，主要是 y 方向残留
-    % （最后 4 s 从环绕段收尾时的 y 偏移 123 mm 衰减到 75 mm）。
-    checks = addCheck(checks, '降落终点残差 < 0.10 m', ...
-        s.landingPointError < 0.10, ...
-        sprintf('%.1f mm (落点 [%.3f %.3f %.3f])', ...
-        1000 * s.landingPointError, finalPos(1), finalPos(2), finalPos(3)), ...
-        '< 0.10 m');
-else
-    checks = addCheck(checks, '负载终位置接近目标', norm(finalPos - target) < 0.02, ...
-        sprintf('[%.4f %.4f %.4f] m', finalPos(1), finalPos(2), finalPos(3)), ...
-        '欧氏距离 < 0.02 m');
-end
 
 % ==================== 八字避障工况专项自检 ====================
 % 这一组的门限全部来自**实测调参数值**，不是拍脑袋的数字。
 % 调参过程与背后的两个根因（包络加速度尖峰 + q_id_dot 差分噪声）
 % 记录在 README §10 与参数文件的注释里。
-if isFigureEight
-    fe = cfg.figureEight;
-
-    % ---- 三阶段跟踪误差 ----
-    % 门限全部按**最终参数集（KX=14, KV=8.68, KI=3.0, B=6.0, noQIDDOT）**的
-    % 实测值留裕度设定，见 _diag_fe_final.py / README §10。
-    %   实测：起飞峰 23.4 mm / 环绕峰 587.9 mm 均 117.3 mm / 降落峰 122.9 mm
-    %        末点残差 78.7 mm / Tmin 0.0985 N / 推力峰 70.8%
-    % 起飞段：只是竖直爬升，参考加速度小，应达到 cm 级
-    checks = addCheck(checks, '起飞段跟踪误差 < 50 mm', ...
-        s.maxPositionErrorTakeoff < 0.050, ...
-        sprintf('%.1f mm', 1000 * s.maxPositionErrorTakeoff), '< 50 mm');
-
-    % 环绕段：±1.5 m 大幅机动 + 绳摆耦合。
-    % ★ 门限按实测峰 588 mm 留约 70% 裕度取 1.0 m —— 既能守住
-    %   "不发散、不失控"，又不会因正常机动误报。
-    % ★ 误差主要来自**绳摆相位滞后**，不是控制器不稳：
-    %   位置环带宽 wn = 3.74 rad/s 是绳摆频率 sqrt(g/l) = 5.29 rad/s 的 0.71 倍。
-    %   这是**刻意**选的 —— 实测把带宽提到 1.0 倍反而 2.42 s 就发散
-    %   （寄生耦合：位置环越快越把平动转成摆动），详见参数文件的长注释。
-    checks = addCheck(checks, '环绕段跟踪误差峰值 < 1.0 m', ...
-        s.maxPositionErrorCruise < 1.0, ...
-        sprintf('%.1f mm', 1000 * s.maxPositionErrorCruise), '< 1.0 m');
-    checks = addCheck(checks, '环绕段跟踪误差均值 < 0.25 m', ...
-        s.meanPositionErrorCruise < 0.25, ...
-        sprintf('%.1f mm', 1000 * s.meanPositionErrorCruise), '< 0.25 m');
-
-    % 降落段：z 收得很干净（实测 <= 3 mm），水平残差见下一项
-    checks = addCheck(checks, '降落段跟踪误差 < 0.20 m', ...
-        s.maxPositionErrorLanding < 0.20, ...
-        sprintf('%.1f mm', 1000 * s.maxPositionErrorLanding), '< 0.20 m');
-
-    % ---- 环绕的是不是"八字" ----
-    % 判据：x 方向必须完成 2*cycles 次往复，即轨迹在 x 上至少走满 ±amplitudeX
-    % 的 80%（跟随误差会让实际幅值略小于期望幅值）。
-    xSpan = s.trajectorySpan(1);
-    checks = addCheck(checks, 'x 方向完成 2*cycles 次往复', ...
-        xSpan > 1.6 * fe.amplitudeX, ...
-        sprintf('x 行程 %.3f m（期望幅值 ±%.2f m）', xSpan, fe.amplitudeX), ...
-        sprintf('> %.2f m', 1.6 * fe.amplitudeX));
-
-    % ---- 绕开两个锥形障碍物（论文 Fig. 3 的核心要求）----
-    % ★★ 必须同时检查"有效性"，不能只看数值。 ★★
-    %   本自检曾经因为高度量定义混乱而**静默失效**：所有环绕段采样都走进
-    %   gap = inf 分支，于是 min 净间隙是一个与环绕段无关的起飞瞬间值，
-    %   然而判据照样 PASS —— 属于"根本没检查"却报"通过"。
-    %   所以这里拆成两步：
-    %     (1) obstacleClearanceValid —— 环绕段是否真的进入了锥的高度区间；
-    %     (2) obstacleClearanceOk    —— 净间隙是否 > 规定值（已内含 (1)）。
-    if cfg.obstacles.enabled
-        branchCounts = [0, 0, 0];
-        if isfield(s, 'obstacleBranchCounts')
-            branchCounts = s.obstacleBranchCounts;
-        end
-        validFlag = true;
-        if isfield(s, 'obstacleClearanceValid')
-            validFlag = s.obstacleClearanceValid;
-        end
-        % (1) 有效性：落在锥高度区间内的采样点必须非零
-        checks = addCheck(checks, '锥形障碍物净间隙自检有效（非静默失效）', ...
-            validFlag, ...
-            sprintf('落在锥高度区间内的采样 %d 点（锥顶以上 %d、锥底以下 %d）', ...
-            branchCounts(1), branchCounts(2), branchCounts(3)), ...
-            '区间内采样 > 0（否则避障从未被真正检查）');
-        % 锥尖必须高于环绕平面，否则负载会从锥顶上方飞过、避障形同虚设
-        apexAboveGround = -cfg.obstacles.baseZ + cfg.obstacles.height;
-        checks = addCheck(checks, '锥尖高于环绕平面（避障为真实约束）', ...
-            apexAboveGround > abs(fe.cruiseHeight), ...
-            sprintf('锥尖离地 %.2f m vs 环绕平面离地 %.2f m', ...
-            apexAboveGround, abs(fe.cruiseHeight)), ...
-            '锥尖 > 环绕平面');
-        % (2) 净间隙
-        checks = addCheck(checks, '负载到锥形障碍物净间隙 > 规定值', ...
-            s.obstacleClearanceOk, ...
-            sprintf('最小净间隙 %.1f mm (t = %.2f s)，负载外接球半径 %.1f mm', ...
-            1000 * s.minObstacleClearance, s.minObstacleClearanceTime, ...
-            1000 * s.payloadBoundingRadius), ...
-            sprintf('> %.0f mm', 1000 * cfg.obstacles.clearance));
-    end
-
-    % ---- 包络参数是否在安全区 ----
-    % blendTime 太小会让包络二阶导在环绕段两端制造加速度尖峰并导致发散
-    % （B=1.2 s 时参考加速度峰值 9.20 m/s²，是纯八字理论峰值 2.92 m/s² 的 3.15 倍）。
-    % 这里显式断言它，防止将来有人为了"贴近论文"把它调小。
-    checks = addCheck(checks, '包络过渡时长 blendTime >= 5 s', ...
-        fe.blendTime >= 5.0, ...
-        sprintf('%.1f s', fe.blendTime), '>= 5 s（否则包络加速度尖峰会发散）');
-end
 
 nPass = 0;
 for i = 1:numel(checks)
@@ -517,37 +352,6 @@ if isfield(s, 'steadyYawTrackingError') && isfinite(s.steadyYawTrackingError)
         rad2deg(s.finalYawTrackingError));
 end
 fprintf('  最大位置误差        : %.4f m\n', s.maxPositionError);
-if isFigureEight && isfield(s, 'phaseWindows') && ~isempty(s.phaseWindows)
-    w = s.phaseWindows;
-    fprintf('\n--- 八字避障工况指标 ---\n');
-    fprintf('  起飞段 [0, %.1f s]      : 误差峰值 %.1f mm\n', ...
-        s.durationPhases(1), 1000 * s.maxPositionErrorTakeoff);
-    fprintf('  环绕段 [%.1f, %.1f s]   : 误差峰值 %.1f mm / 均值 %.1f mm\n', ...
-        s.durationPhases(1), s.durationPhases(2), ...
-        1000 * s.maxPositionErrorCruise, 1000 * s.meanPositionErrorCruise);
-    fprintf('  降落段 [%.1f, %.1f s]  : 误差峰值 %.1f mm\n', ...
-        s.durationPhases(2), s.durationPhases(3), ...
-        1000 * s.maxPositionErrorLanding);
-    fprintf('  降落终点残差        : %.1f mm\n', 1000 * s.landingPointError);
-    fprintf('  轨迹行程 (x, y)     : (%.3f, %.3f) m\n', ...
-        s.trajectorySpan(1), s.trajectorySpan(2));
-    if isfield(cfg, 'obstacles') && cfg.obstacles.enabled
-        fprintf('  到锥最小净间隙      : %.1f mm (t = %.2f s)%s\n', ...
-            1000 * s.minObstacleClearance, s.minObstacleClearanceTime, ...
-            ternary(s.obstacleClearanceOk, '  [OK]', '  [过近!]'));
-        if isfield(s, 'obstacleBranchCounts')
-            bc = s.obstacleBranchCounts;
-            fprintf('    自检有效性        : %s  (锥高度区间内 %d 点 / 锥顶以上 %d / 锥底以下 %d)\n', ...
-                ternary(s.obstacleClearanceValid, '[有效]', '[★静默失效★]'), ...
-                bc(1), bc(2), bc(3));
-        end
-        fprintf('    锥尖离地 / 环绕平面: %.2f m / %.2f m%s\n', ...
-            -cfg.obstacles.baseZ + cfg.obstacles.height, abs(cfg.figureEight.cruiseHeight), ...
-            ternary(-cfg.obstacles.baseZ + cfg.obstacles.height > abs(cfg.figureEight.cruiseHeight), ...
-            '  [锥尖更高，避障为真实约束]', '  [★锥尖偏低，负载会从上方飞过★]'));
-    end
-    fprintf('  包络过渡时长        : %.1f s\n', cfg.figureEight.blendTime);
-end
 fprintf('\n');
 fprintf('  各绳索稳态张力      : %s N  (理论 %s，合计 %.4f = m0 g)\n', ...
     tensionStr(s.steadyTension(:)), tensionStr(tensionTheory), ...
@@ -643,14 +447,5 @@ if isempty(list)
     list = entry;
 else
     list(end + 1) = entry;
-end
-end
-
-function out = ternary(condition, whenTrue, whenFalse)
-% 三元表达式（MATLAB 没有内置，自己写一个保持调用处紧凑）。
-if condition
-    out = whenTrue;
-else
-    out = whenFalse;
 end
 end

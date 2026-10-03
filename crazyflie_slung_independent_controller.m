@@ -79,6 +79,13 @@ for i = 1:n
             cfg.takeoff.independentMaxFeedbackAcceleration(:));
     end
     A = m * (feedbackAcceleration + desiredAcceleration(:, i) - g * e3);
+    if isfield(cfg.attitudeController, 'omegaCMethod') ...
+            && strcmpi(cfg.attitudeController.omegaCMethod, 'command_filter')
+        [A, memory] = filterAttitudeForceCommand(A, i, memory, cfg);
+    elseif isfield(cfg.attitudeController, 'omegaCMethod') ...
+            && strcmpi(cfg.attitudeController.omegaCMethod, 'high_gain_observer')
+        [~, memory] = updateHighGainForceDerivative(A, i, memory, cfg);
+    end
     if norm(A) < 1e-8
         b3c = e3;
     else
@@ -95,10 +102,23 @@ for i = 1:n
     Rc = projectSO3([b1c, b2c, b3c]);
 
     eR = 0.5 * vee(Rc.' * R - R.' * Rc);
-    omegaCmd = -cfg.attitudeController.kR(:) .* eR;
+    % 期望姿态角速度前馈（与 v2 同构，与主控制器 crazyflie_slung_controller.m 一致）：
+    %   Omega_cmd = R'R_c Omega_c - kR .* e_R          （useRateDamping=false，同 v2）
+    % Omega_c 由 omegaCMethod 选择：'analytic'、'filtered_log_difference' 或
+    % 'command_filter'；关掉用 'none'。heading 是常量 ⇒ b1dDot = 0。
+    omegaCi = feedforwardBodyRate(Rc, A, heading, zeros(3, 1), i, memory, cfg);
+    feedforward = R.' * Rc * omegaCi;
+    eOmR = state.bodyRates(:, i) - feedforward;
+    omegaCmd = feedforward - cfg.attitudeController.kR(:) .* eR;
+    if cfg.attitudeController.useRateDamping
+        omegaCmd = omegaCmd - cfg.attitudeController.kOmega(:) .* eOmR;
+    end
     omegaCmd = clampVector(omegaCmd, ...
         -cfg.takeoff.independentMaxBodyRate(:), ...
         cfg.takeoff.independentMaxBodyRate(:));
+    memory.previousVehicleRc(:, :, i) = Rc;
+    memory.previousVehicleU(:, i) = A;
+    memory.feedforwardRate(:, i) = omegaCi;
     thrust = clamp(-dot(A, R * e3), 0, cfg.vehicle.maxTotalThrust);
 
     forceAll(:, i) = A;
@@ -109,6 +129,7 @@ for i = 1:n
     positionErrorAll(:, i) = ep;
     velocityErrorAll(:, i) = ev;
 end
+memory.feedforwardStarted = true;       % 下一拍才有可用的历史 R_ic
 
 command = struct();
 command.positionError = mean(positionErrorAll, 2);
@@ -144,6 +165,149 @@ if n < eps
     q = [0; 0; 1];
 else
     q = q / n;
+end
+end
+
+% ======================================================================
+function omegaC = feedforwardBodyRate(Rc, ui, b1d, b1dDot, index, memory, cfg)
+%FEEDFORWARDBODYRATE 期望姿态 R_ic 的角速度前馈 Omega_ic（负载体系）。
+% 与 crazyflie_slung_controller.m 里的同名函数**完全一致**（MATLAB 的局部函数是
+% 文件私有的，按本工程约定各自复制一份）。三种算法见那边的说明。
+omegaC = zeros(3, 1);
+method = 'none';
+if isfield(cfg.attitudeController, 'omegaCMethod')
+    method = cfg.attitudeController.omegaCMethod;
+end
+if strcmp(method, 'none') ...
+        || ~isfield(memory, 'feedforwardStarted') || ~memory.feedforwardStarted
+    return
+end
+
+switch method
+    case 'analytic'
+        uiDot = (ui - memory.previousVehicleU(:, index)) / max(cfg.simulation.dt, eps);
+        raw = analyticOmegaC(Rc, ui, uiDot, b1d, b1dDot, cfg);
+    case 'command_filter'
+        raw = analyticOmegaC(Rc, ui, ...
+            memory.filteredVehicleUDot(:, index), b1d, b1dDot, cfg);
+    case 'high_gain_observer'
+        raw = analyticOmegaC(Rc, ui, ...
+            memory.highGainVehicleUDot(:, index), b1d, b1dDot, cfg);
+    case 'filtered_log_difference'
+        previousRc = memory.previousVehicleRc(:, :, index);
+        raw = so3Log(previousRc.' * Rc) / max(cfg.simulation.dt, eps);
+    case 'none'
+        return
+    otherwise
+        return
+end
+
+raw = clampVector(raw, -cfg.attitudeController.feedforwardMaxRate, ...
+    cfg.attitudeController.feedforwardMaxRate);
+tau = cfg.attitudeController.feedforwardFilterTime;
+if tau > 0
+    alpha = cfg.simulation.dt / (tau + cfg.simulation.dt);
+else
+    alpha = 1;
+end
+omegaC = memory.feedforwardRate(:, index) ...
+    + alpha * (raw - memory.feedforwardRate(:, index));
+end
+
+function [filteredU, memory] = filterAttitudeForceCommand(commandU, index, memory, cfg)
+% 二阶命令滤波器：ü_f + 2*zeta*wn*u̇_f + wn^2*u_f = wn^2*u。
+dt = cfg.simulation.dt;
+wn = cfg.attitudeController.commandFilterNaturalFrequency;
+zeta = cfg.attitudeController.commandFilterDampingRatio;
+if ~memory.commandFilterStarted(index)
+    memory.filteredVehicleU(:, index) = commandU;
+    memory.filteredVehicleUDot(:, index) = zeros(3, 1);
+    memory.commandFilterStarted(index) = true;
+else
+    uFiltered = memory.filteredVehicleU(:, index);
+    uFilteredDot = memory.filteredVehicleUDot(:, index);
+    uFilteredDDot = wn^2 * (commandU - uFiltered) - 2 * zeta * wn * uFilteredDot;
+    uFilteredDot = uFilteredDot + dt * uFilteredDDot;
+    uFiltered = uFiltered + dt * uFilteredDot;
+    memory.filteredVehicleU(:, index) = uFiltered;
+    memory.filteredVehicleUDot(:, index) = uFilteredDot;
+end
+filteredU = memory.filteredVehicleU(:, index);
+end
+
+function [estimatedU, memory] = updateHighGainForceDerivative(commandU, index, memory, cfg)
+% 二阶高增益非线性微分器，第二状态 z1 估计 commandU 的导数。
+dt = cfg.simulation.dt;
+lambda1 = cfg.attitudeController.highGainDifferentiatorLambda1;
+lambda2 = cfg.attitudeController.highGainDifferentiatorLambda2;
+sigma = max(cfg.attitudeController.highGainDifferentiatorSmoothing, 1e-9);
+limit = cfg.attitudeController.forceDerivativeLimit;
+if ~memory.highGainObserverStarted(index)
+    memory.highGainVehicleU(:, index) = commandU;
+    memory.highGainVehicleUDot(:, index) = zeros(3, 1);
+    memory.highGainObserverStarted(index) = true;
+else
+    z0 = memory.highGainVehicleU(:, index);
+    z1 = memory.highGainVehicleUDot(:, index);
+    error = commandU - z0;
+    injection = tanh(error / sigma);
+    z0Dot = z1 + lambda1 * sqrt(abs(error) + 1e-12) .* injection;
+    z1Dot = lambda2 * injection;
+    z1 = clampVector(z1 + dt * z1Dot, -limit, limit);
+    z0 = z0 + dt * z0Dot;
+    memory.highGainVehicleU(:, index) = z0;
+    memory.highGainVehicleUDot(:, index) = z1;
+end
+estimatedU = memory.highGainVehicleU(:, index);
+end
+
+% ======================================================================
+function OmegaC = analyticOmegaC(Rc, ui, uiDot, b1d, b1dDot, cfg)
+%ANALYTICOMEGAC 由 R_c 的列向量导数解析求 Omega_c = vee(R_c'RcDot)（与 v2 同构）。
+% 独立起飞控制器没有绷紧段张力分配链；analytic 模式在此仍使用
+% 独立力指令的离散导数，完整解析链只用于主协同搬运控制器。
+b3c = Rc(:, 3);
+forceNorm = norm(ui);
+if forceNorm < cfg.loadController.forceNormEpsilon
+    OmegaC = zeros(3, 1);
+    return
+end
+b3cDot = -(eye(3) - b3c * b3c.') * uiDot / forceNorm;
+
+b1c = Rc(:, 1);
+projection = (eye(3) - b3c * b3c.') * b1d;
+if norm(projection) < cfg.loadController.forceNormEpsilon
+    b1cDot = zeros(3, 1);
+else
+    projectionDot = -(b3cDot * b3c.' + b3c * b3cDot.') * b1d ...
+        + (eye(3) - b3c * b3c.') * b1dDot;
+    b1cDot = (eye(3) - b1c * b1c.') * projectionDot / norm(projection);
+end
+
+b2c = Rc(:, 2);
+b2cDot = cross(b3cDot, b1c) + cross(b3c, b1cDot);
+RcDot = [b1cDot, b2cDot, b3cDot];
+OmegaHat = Rc.' * RcDot;
+OmegaHat = 0.5 * (OmegaHat - OmegaHat.');
+OmegaC = vee(OmegaHat);
+end
+
+% ======================================================================
+function v = so3Log(R)
+%SO3LOG SO(3) 对数映射：旋转矩阵 -> 旋转向量。与 v2 的实现一致。
+R = projectSO3(R);
+cosTheta = min(max((trace(R) - 1) / 2, -1), 1);
+theta = acos(cosTheta);
+if theta < 1e-7
+    v = 0.5 * vee(R - R.');
+elseif abs(pi - theta) < 1e-5
+    [V, D] = eig((R + eye(3)) / 2);
+    [~, idx] = max(real(diag(D)));
+    axisVector = real(V(:, idx));
+    axisVector = axisVector / max(norm(axisVector), eps);
+    v = theta * axisVector;
+else
+    v = theta / (2 * sin(theta)) * vee(R - R.');
 end
 end
 

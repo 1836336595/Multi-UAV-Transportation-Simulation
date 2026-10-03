@@ -13,8 +13,15 @@ function [derivative, info] = crazyflie_slung_dynamics(state, uAll, cfg)
 %           = sum_i hat(rho_i) R0' ( u||_i - m_i l_i ||omega_i||^2 q_i - m_i q_i q_i' R0 hat(Omega0)^2 rho_i )
 %   (7) 第 i 根绳索
 %       omega_dot_i = (1/l_i) hat(q_i) a_i - (1/(m_i l_i)) hat(q_i) u_perp_i
-%   (8) 第 i 架四旋翼姿态
-%       J_i Omega_dot_i + Omega_i x J_i Omega_i = M_i
+%   (8) 第 i 架四旋翼姿态 —— **本文件不做刚体建模**（与 v2 一致）
+%       Omega_dot_i = state.bodyRateDots_i
+%       机体角加速度由仿真主程序的**固件速率环**给出：
+%           Omega_dot_i = rateLoop.bandwidth .* (Omega_cmd_i - Omega_i)
+%       论文 (8) 的 J_i Omega_dot_i + Omega_i x J_i Omega_i = M_i 形式不再需要：
+%       若把速率环的角加速度包成 M_i = J_i·alpha + Omega_i x J_i Omega_i，
+%       再代回 (8) 就恒等于 Omega_dot_i = alpha，J_i 与叉乘项完全抵消。
+%       这也符合真实 Crazyflie：飞控只接受角速度指令，力矩由固件速率环产生。
+%       详见 crazyflie_slung_parameters.m 中 cfg.vehicle 上方的推导。
 %
 % 其中等效质量矩阵（论文 (5) 之后正文）
 %       Mq = m0 I + sum_i m_i q_i q_i'
@@ -45,7 +52,7 @@ function [derivative, info] = crazyflie_slung_dynamics(state, uAll, cfg)
 %   linkRates (3xn)          第 i 列 = q_i_dot
 %   rotations (3x3xn)        第 i 页 = R_i
 %   bodyRates (3xn)          第 i 列 = Omega_i
-%   bodyTorques (3xn)        第 i 列 = M_i（由仿真主程序的内环速率环给出）
+%   bodyRateDots (3xn)       第 i 列 = Omega_dot_i（由仿真主程序的固件速率环给出）
 %
 % 输出额外字段：
 %   linkPerpForces (3xn)     第 i 列 = u_perp_i，供仿真主程序的诊断项
@@ -69,7 +76,6 @@ m0 = cfg.payload.mass;
 J0 = cfg.payload.inertia;
 rhoAll = cfg.payload.attachPoints;            % 3 x n
 m = cfg.vehicle.mass;
-J = cfg.vehicle.inertia;
 l = cfg.link.length;
 n = cfg.vehicle.count;
 uAll = reshape(uAll, 3, n);
@@ -277,12 +283,10 @@ for i = 1:n
     % 由 q_ddot = omega_dot x q + omega x (omega x q) 得到绳索向量的二阶导
     qDotDotAll(:, i) = cross(omegaDotI, qi) + cross(omegai, cross(omegai, qi));
 
-    % 论文 (8)：机体姿态动力学。
-    % 本方案的角速度内环在仿真主程序中把 Omega_cmd_i 转成等效力矩 M_i，
-    % 此处只负责由力矩推进机体角速度。
-    OmegaI = OmAll(:, i);
-    Mi = state.bodyTorques(:, i);
-    OmegaDotAll(:, i) = J \ (Mi - cross(OmegaI, J * OmegaI));
+    % (8) 第 i 架四旋翼姿态：**不做刚体建模**，直接取固件速率环给出的角加速度。
+    %   机体惯量 J_i 会与姿态方程里的叉乘项完全抵消（见文件头 (8) 的说明），
+    %   所以这里既不需要 J_i，也不需要把它包成力矩。
+    OmegaDotAll(:, i) = state.bodyRateDots(:, i);
 end
 
 % ------------------------------------------------------------------ 输出

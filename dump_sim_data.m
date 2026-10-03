@@ -134,7 +134,7 @@ R = pushLine(R, '  负载质量 m0             : %.6g kg', cfg.payload.mass);
 R = pushLine(R, '  负载尺寸 (a,b,c)        : [%s] m', numVecText(cfg.payload.size(:).', '%.4g '));
 R = pushLine(R, '  单机质量 / 绳长         : %.6g kg / %.6g m', cfg.vehicle.mass, cfg.link.length);
 R = pushLine(R, '  仿真时长 / dt / 步数    : %.4g s / %.6g s / %d', cfg.simulation.duration, cfg.simulation.dt, nSteps);
-R = pushLine(R, '  期望轨迹函数            : %s', ternaryStr(isempty(cfg.referenceFcn), '空 ⇒ 静态悬停/定高工况', '已设置 ⇒ 轨迹工况'));
+R = pushLine(R, '  参考轨迹                : 静态目标（定高工况，无外部轨迹函数）');
 R = pushLine(R, '  target.position         : [%s] m  ⇒ 目标高度 %.6g m', ...
     numVecText(cfg.target.position(:).', '%.6g '), targetH);
 if isfield(cfg, 'takeoff') && isfield(cfg.takeoff, 'enabled')
@@ -284,10 +284,6 @@ end
 
 R = pushLine(R, '');
 R = pushLine(R, '【F】sim.summary 全字段');
-R = pushLine(R, '  ⚠ 以下字段在**定高**工况下没有物理意义，不要当成控制误差看：');
-R = pushLine(R, '    landingPointError —— 它是"地面静止点到**八字落点**的距离"（构造量）。');
-R = pushLine(R, '      实测 0.3425 m 就是 norm([0.1,-0.06,-0.028] - [0,0,-0.35])，与跟踪无关。');
-R = pushLine(R, '    phaseWindows / figureEightCycles / durationPhases —— 八字工况的三阶段指标。');
 R = pushLine(R, '  ⚠ minLinkVerticalComponent = 0 与"绳长范数偏差 = 1"来自 SLACK / TAKEUP /');
 R = pushLine(R, '    LANDING_RELEASE 这些**绳索未建模**的相位（那时 q_i 记作 0 向量），');
 R = pushLine(R, '    不是动力学问题 —— 绳向类判据必须限定在绷紧段（模式 2/3/4）。');
@@ -491,13 +487,5 @@ if isfield(s, name)
     v = s.(name);
 else
     v = fallback;
-end
-end
-
-function out = ternaryStr(condition, whenTrue, whenFalse)
-if condition
-    out = whenTrue;
-else
-    out = whenFalse;
 end
 end

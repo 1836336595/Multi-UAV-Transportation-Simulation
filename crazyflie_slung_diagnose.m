@@ -23,7 +23,6 @@ fprintf('==============================================================\n');
 
 % ------------------------------------------------ 1) 实际生效的参数
 cfg = crazyflie_slung_parameters();
-fe = cfg.figureEight;
 
 fprintf('\n[1] 实际生效的关键参数（请对照 README §11 核对）\n');
 fprintf('  ---- 挂点 attachPoints（列 = 挂点 rho_i）----\n');
@@ -40,14 +39,6 @@ fprintf('  等效姿态环 wn = sqrt(BW*kR) = %.1f rad/s, zeta = %.3f\n', ...
     cfg.rateLoop.bandwidth(1) * (1 + cfg.attitudeController.kOmega(1)) ...
     / (2 * sqrt(cfg.rateLoop.bandwidth(1) * cfg.attitudeController.kR(1))));
 
-fprintf('  ---- 八字工况 ----\n');
-fprintf('  amplitudeX=%.2f  amplitudeY=%.2f  cycles=%.1f\n', ...
-    fe.amplitudeX, fe.amplitudeY, fe.cycles);
-fprintf('  takeoff=%.1f  cruise=%.1f  landing=%.1f  duration=%.1f\n', ...
-    fe.takeoffDuration, fe.cruiseDuration, fe.landingDuration, cfg.simulation.duration);
-fprintf('  blendTime=%.2f  cruiseHeight=%.2f  lockYaw=%d\n', ...
-    fe.blendTime, fe.cruiseHeight, fe.lockYaw);
-
 fprintf('  ---- 负载控控制/绳向控器 ----\n');
 fprintf('  kx=[%s]  kv=[%s]  ki=[%s]\n', mat2str(cfg.loadController.kx.', 4), ...
     mat2str(cfg.loadController.kv.', 4), mat2str(cfg.loadController.ki.', 4));
@@ -59,11 +50,6 @@ fprintf('  initial.position   = [%s]\n', mat2str(cfg.initial.position.', 4));
 fprintf('  initial.thrustNewton = [%s]   (1 x n = %d)\n', ...
     mat2str(cfg.initial.thrustNewton(:).', 6), numel(cfg.initial.thrustNewton));
 fprintf('  initial.linkUnits  =\n'); disp(cfg.initial.linkUnits);
-
-fprintf('  ---- 障碍物 ----\n');
-fprintf('  obstacles.positions =\n'); disp(cfg.obstacles.positions);
-fprintf('  height=%.2f  radius=%.2f  baseZ=%.2f\n', ...
-    cfg.obstacles.height, cfg.obstacles.radius, cfg.obstacles.baseZ);
 
 % ------------------------------------------------ 2) 跑仿真（不画图）
 fprintf('\n[2] 运行仿真（不绘图）…\n');
@@ -97,7 +83,7 @@ fprintf('  完成，用时 %.1f s\n', toc(t0));
 % ------------------------------------------------ 3) 找第一个非有限步
 logNames = {'loadPositionLog', 'loadVelocityLog', 'loadRotationLog', 'loadBodyRateLog', ...
     'linkUnitLog', 'linkRateLog', 'rotationLog', 'bodyRateLog', ...
-    'thrustLog', 'tensionLog', 'momentLog', 'positionErrorLog'};
+    'thrustLog', 'tensionLog', 'bodyRateDotLog', 'positionErrorLog'};
 
 nSteps = numel(sim.time);
 bad = false(1, nSteps);

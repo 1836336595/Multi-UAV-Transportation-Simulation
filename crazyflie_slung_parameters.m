@@ -29,12 +29,10 @@ if nargin < 1 || isempty(userCfg)
 end
 
 % ---------------------------------------------------------------- 仿真设置
-% ★ 时长 25 s = 三阶段之和（起飞 3 + 环绕 18 + 降落 4），与 cfg.figureEight 一致。
-%   这是八字避障工况的值；若退回静态悬停工况（cfg.referenceFcn = []），
-%   建议把时长改回 30 s（悬停收敛需要更长时间）。
+% ★ 本分支是**定高**工况（无水平机动），默认时长 30 s。
 %   历史说明：静态工况下不存在真稳态，位置误差在 t = 30 s 取最小 3.63 mm 后
-%   回升、77.2 s 完全发散（旧版本 yaw 符号和反馈配置错误），故 30 s 仍作为
-%   静态工况的默认展示窗口；当前 yaw 通道默认开启并单独记录跟踪误差。
+%   回升、77.2 s 完全发散（旧版本 yaw 符号和反馈配置错误），故 30 s 作为
+%   默认展示窗口；当前 yaw 通道默认开启并单独记录跟踪误差。
 %   dt = 0.002 s 对应 500 Hz。
 cfg.simulation = struct(...
     'duration', 30.0, ...          % 定高悬停 30 s（悬停收敛需要更长时间）
@@ -102,22 +100,34 @@ cfg.payload.rotationalDampingReferenceSize = cfg.payload.size;
 cfg.payload.attachPoints = bsxfun(@times, cfg.payload.size(:), ...
     cfg.payload.attachFractions);
 
-% ------------------------------------- Crazyflie 2.1 Brushless（真实参数）
-% 质量：含电池、无桨叶保护罩的标称起飞质量 0.0325 kg（Bitcraze 官方规格）。
-% 最大推力：4 x 34 gf = 136 gf ≈ 1.334 N（Bitcraze 官方参数）。
-% 惯量：Bitcraze 未公开 Brushless 版本转动惯量，按同量级长方体估算，
-%       真实飞行前应通过台架辨识替换。
+% ------------------------------------- Crazyflie 2.1 Brushless
+% ★★ 四旋翼**不做刚体姿态建模**（与 v2 的 crazyflie_ctbr_simulation.m 一致）：
+%   机体转动惯量既不需要、也不影响任何结果。原因可以自己验算 ——
+%   速率环给出的角加速度是 α_cmd，若再把它包成力矩
+%        M_i = J_i·α_cmd + Ω_i × J_i Ω_i
+%   而姿态方程又是
+%        Ω̇_i = J_i⁻¹ ( M_i − Ω_i × J_i Ω_i )
+%   代回去恰好得到 **Ω̇_i = α_cmd**，J_i 与叉乘项完全抵消。
+%   ⇒ 直接用"角速度指令 → 一阶速率环 → 角速度 → 积分得到姿态"：
+%        Ω̇_i = rateLoop.bandwidth .* (Ω_cmd_i − Ω_i)
+%        R_i ← R_i · exp(hat(Ω_i)·dt)
+%   这也是真实 Crazyflie 的用法：飞控只接受**角速度指令**
+%   （cflib 的 send_setpoint(..., rate=True)），力矩由固件自己的速率环产生，
+%   外部无需知道机体惯量。
+%
+%   质量：含电池、无桨叶保护罩的标称起飞质量 0.0325 kg（Bitcraze 官方规格）。
+%   最大推力：4 x 34 gf = 136 gf ≈ 1.334 N（Bitcraze 官方参数），只用作推力饱和限幅。
+%   推力时间常数：一阶执行器响应；真实飞行前应通过台架辨识替换。
+%   臂长 / 旋翼半径 / 机体外形 / 视觉转速：**只给三维显示与碰撞半径用**，不进动力学。
 cfg.vehicle = struct(...
     'count', 3, ...                                % n，四旋翼数量（须 >= 3，见文件末尾检查）
     'mass', 0.0325, ...                            % m_i [kg]
     'gravity', 9.81, ...                           % g [m/s^2]
-    'inertia', diag([2.395e-5, 2.395e-5, 3.234e-5]), ... % J_i [kg*m^2]
-    'armLength', 0.0465, ...                       % 电机轴到质心距离 [m]（显示用）
-    'maxThrustSingle', 0.3336, ...                 % 单电机最大推力 [N] = 34 gf
-    'maxTotalThrust', 1.3344, ...                  % 单机 4 电机最大总推力 [N] = 136 gf
+    'armLength', 0.0465, ...                       % 电机轴到质心距离 [m]（显示 + 碰撞半径）
+    'maxTotalThrust', 1.3344, ...                  % 单机 4 电机最大总推力 [N] = 136 gf（推力饱和限幅）
     'thrustTimeConstant', 0.012, ...               % 推力一阶响应时间常数 [s]
     'bodySize', [0.050; 0.050; 0.014], ...         % 机体中心板外形 [m]（仅三维显示）
-    'rotorRadius', 0.023, ...                      % 单个旋翼半径 [m]（仅三维显示）
+    'rotorRadius', 0.023, ...                      % 单个旋翼半径 [m]（显示 + 碰撞半径）
     'rotorSpinHz', 4.0);                           % 动画里旋翼视觉转速 [Hz]（仅显示）
 
 % ------------------------------------------------------ 绳索（只受拉、无质量、绷紧时与刚性连杆力学等价）
@@ -267,7 +277,7 @@ cfg.loadController = struct(...
 %     不与摆模态共振），而不是 1.0 倍。
 %   ★ 边界很陡：14 -> 20 之间只有一步之差就发散。因此 KX = 14 是
 %     "贴着边界取"的最优值，靠下面三项裕度守住：
-%       a. blendTime = 6.0 s（消除参考加速度尖峰，见 cfg.figureEight 说明）
+%       a. 参考剖面用 5 次多项式（两端速度/加速度为 0，消除参考加速度尖峰）
 %       b. USE_QID_DOT = false（去掉 q_id_dot 差分噪声，见 controller.m 说明）
 %       c. KV/KX = 0.62（zeta ≈ 0.90，给摆模态留阻尼裕度）
 %   ★ KV 的取法：闭环二阶特性 wn = sqrt(KX)，zeta = KV / (2 sqrt(KX))。
@@ -368,16 +378,60 @@ cfg.linkController = struct(...
 %   ★ 悬崖在 ×3 与 ×5 之间；×5~×20 是性能几乎不变的平台区，取 ×8 居中留裕度。
 %   ★ 这不是"用增益压住问题"：绳索反作用不对称是真实的物理扰动，
 %     提高机体姿态环带宽是对应的、正确的处置。
+%
+% ★★ 外层姿态环的**结构**（2026-10-03 改为与 v2 同构）：
+%     Omega_cmd = R'R_c·Omega_ic            <- 期望姿态角速度**前馈**
+%                 - kR  .* e_R
+%                 [- kOmega .* (Omega - R'R_c·Omega_ic)]   <- 仅 useRateDamping=true
+%                 - kIR .* ∫e_R             <- 外层积分，默认关闭（与 v2 的
+%                                              useIntegral=false 一致）
+%   ★★ `useRateDamping` 决定要不要那一项**速率阻尼**：
+%      false（默认）= **与 v2 完全一致的式子**（v2 没有这项，阻尼交给内环 PI）
+%      true         = 论文原式（Lee 2018 (30) 的 e_Omega 项），保留 kOmega
+%   `omegaCMethod` 决定前馈 Omega_ic 的计算方式：
+%      'analytic'（默认）= 按 Fd/Md -> mu_id -> q_id -> a_i -> u_i^cmd 的完整链式法则求导
+%      'filtered_log_difference' = 相邻期望姿态的 SO(3) 对数差分
+%      'command_filter' = 先用二阶命令滤波器平滑 u_i^cmd，同时直接得到其导数，
+%                         滤波后的力同时用于姿态和推力，保证两者一致
+%      'high_gain_observer' = 用二阶高增益非线性微分器估计 u̇_i^cmd
+%      'none' = 关闭前馈（Omega_ic ≡ 0）
+%   ★ 为什么仍要限幅/低通：前馈的种子（u_i^cmd 的变化）含张力分配/绳向环的高频
+%     抖动，裸的 1/dt 差分会把抖动放大成每秒几百弧度的假前馈（1/dt = 500）。
+%     本项目实测过该自激（姿态误差 0.6 deg 随时间涨到 8.9 deg、机体角速度
+%     长期 4.2 rad/s），所以历史上是把前馈整项置零的。现在按 v2 结构启用，
+%     但用 `feedforwardFilterTime` 低通、并用 `feedforwardMaxRate` 限幅。
+%     若仍见姿态误差缓慢增长 ⇒ 调大 tau，或设 omegaCMethod = 'none'。
 cfg.attitudeController = struct(...
     'kR', [240.0; 240.0; 120.0], ...  % 姿态误差 -> 角速度 的增益 [rad/s]
-    'kOmega', [4.0; 4.0; 4.0], ...    % 角速度误差 -> 角速度 的增益（阻尼）
+    'kOmega', [4.0; 4.0; 4.0], ...    % 角速度误差 -> 角速度 的增益（仅 useRateDamping=true 时生效）
+    'useRateDamping', false, ...      % 是否加 -kOmega·e_Omega（false = 与 v2 完全一致）
+    'omegaCMethod', 'high_gain_observer', ...   % 'analytic' | 'command_filter' | 'high_gain_observer' | 'filtered_log_difference' | 'none'
+    'feedforwardFilterTime', 0.020, ... % 前馈的一阶低通时间常数 [s]（0 = 不滤波）
+    'feedforwardMaxRate', 20.0, ...   % 前馈原始值限幅 [rad/s]（防止差分尖峰灌进指令）
+    'commandFilterNaturalFrequency', 20.0, ... % command_filter 的自然频率 [rad/s]
+    'commandFilterDampingRatio', 1.0, ...      % command_filter 的阻尼比 [-]
+    'highGainDifferentiatorLambda1', 20.0, ...  % 高增益微分器 lambda_1
+    'highGainDifferentiatorLambda2', 100.0, ... % 高增益微分器 lambda_2
+    'highGainDifferentiatorSmoothing', 1e-3, ... % tanh 平滑尺度 [N]
+    'forceDerivativeLimit', 1000.0, ...         % 力导数估计限幅 [N/s]
+    'useIntegral', false, ...         % 外层姿态积分开关（与 v2 的 useIntegral 默认一致：关闭）
+    'kIR', [0.15; 0.15; 0.10], ...    % 外层姿态积分增益（仅 useIntegral = true 时生效）
+    'integralLimit', [0.5; 0.5; 0.5], ... % 外层姿态积分限幅 [rad*s]
     'maxBodyRateCommand', [5.0; 5.0; 3.5], ... % 角速度指令限幅 [rad/s]
     'maxAttitudeError', 2.0, ...      % 姿态误差范数限幅 [rad]
     'headingSource', 'reference');       % 机体航向来源：'reference'(论文原式) | 'worldX'(锁定+x)
 
 % --------------------------- 内环速率跟踪（等效 Crazyflie 内部速率 PID 闭环）
+% ★★ 与 v2 同构：**PI**（比例 + 积分），而不是纯比例一阶环节。
+%    比例部分保留本项目原值 bandwidth；积分部分取 v2 的 ki 量级。
+%    动力学上就是   Omega_dot_i = bandwidth .* e_i + integralGain .* ∫e_i，
+%    其中 e_i = Omega_cmd_i - Omega_i（机体惯量不需要，见上面 cfg.vehicle 的说明）。
+%    ★ 积分器有限幅；但没有做"抗饱和 gate"。如果观察到指令长期饱和后恢复时
+%      出现慢速过冲，参考独立控制器里独立位置积分器抗饱和的做法（加误差门控）。
 cfg.rateLoop = struct(...
-    'bandwidth', [35.0; 35.0; 20.0]); % 角速度环一阶带宽 [rad/s]
+    'bandwidth', [35.0; 35.0; 20.0], ...  % 比例部分，角速度环带宽 [1/s]
+    'integralGain', [3.0; 3.0; 2.0], ...  % 积分部分 [1/s^2]（取 v2 的 ki 量级）
+    'integralLimit', [1.5; 1.5; 1.0]);    % 积分限幅 [rad]（v2 的值）
 
 % --------------------------------------------------------------- 初始条件
 % 给负载一个明显的初始位置/姿态偏差，各各绳也给不同的初始倾角，
@@ -422,193 +476,16 @@ cfg.target.velocity = zeros(3, 1);
 cfg.target.acceleration = zeros(3, 1);
 cfg.target.rpy = deg2rad([0; 0; 9]);
 
-% ------------------------------------------------------------ 期望轨迹
-% ★ 默认工况**由静态悬停改为三阶段八字避障轨迹**（对应论文 Lee 2018 Fig. 3）。
-%   要回到原来的静态悬停工况，执行：
-%       cfg = crazyflie_slung_parameters();
-%       cfg.referenceFcn = [];            % 清空轨迹函数即回退到 target 静态点
-%       cfg.simulation.duration = 30.0;
-%       sim = crazyflie_slung_simulation(cfg);
-%
-% 三阶段设计（用户要求：起飞 -> 环绕两个八字 -> 降落）：
-%   阶段 0  起飞    t ∈ [0, 3)      从 initial.position 平滑爬到环绕平面
-%   阶段 1  环绕    t ∈ [3, 48)     绕两个完整八字（横宽 ±1.5 m）
-%   阶段 2  降落    t ∈ [48, 52]    水平归位 + 竖直下降到 target 落点
-% 三段在拼接点上位置/速度/加速度全部连续（C^2），由
-% crazyflie_slung_reference.m 里的 smoothstep 与两端对称包络保证。
-% ★★ 两个锥形障碍物摆在八字的**两个叶心**，负载**环绕**它们飞行 ★★
-%   （见 cfg.obstacles 与 README §11；原来的做法是把锥放在轨迹 x 极值处，
-%     那是"擦着锥过"，不是"绕锥飞"，已按用户要求改正。）
-cfg.figureEight = struct(...
-    'amplitudeX', 1.50, ...          % x 方向半宽 [m]
-    'amplitudeY', 1.62, ...          % y 方向半长 [m]
-    'omegaX', 0.2 * pi, ...          % x 角频率 [rad/s]（论文原值 0.2*pi）
-    'omegaY', 0.1 * pi, ...          % y 角频率 [rad/s]（论文原值 0.1*pi）
-    'cycles', 2.0, ...               % 环绕段覆盖几个完整八字
-    'takeoffDuration', 3.0, ...      % 起飞段时长 [s]
-    'cruiseDuration', 45.0, ...      % 环绕段时长 [s]（★ 45，原 18，见下）
-    'landingDuration', 4.0, ...      % 降落段时长 [s]
-    'cruiseHeight', -0.55, ...       % 环绕平面高度 [m]（z 向下为正，故为负）
-    'startPosition', cfg.initial.position, ...   % 起飞起点（与 initial.position 一致）
-    'landPosition', [0.00; 0.00; -0.35], ...    % 降落落点（与 target.position 一致）
-    'lockYaw', true, ...            % ★ 默认固定参考 yaw，先验证 yaw 闭环本身
-    'blendTime', 5.0);               % 环绕段两端的速度过渡时长 [s]（★ 见下）
-% ★★ cruiseDuration 为什么从 18 加长到 45、blendTime 从 6.0 收到 5.0 ★★
-%   这一条是"让轨迹**真正环绕**锥"的关键，与稳定性方向一致，不是妥协。
-%
-%   问题：环绕段参考轨迹是 p_d = env(t)·[p̂x(τ), p̂y(τ)]（**以原点为中心**），
-%   其中 env(t) = σ(t/B)·σ((T2-t)/B) 是两端对称包络。而"两个八字"意味着
-%   整个八字要在环绕段里被描出 **两次**（τ 从 0 走到 40）。
-%   于是 env 一旦只在中段等于 1，八字就是在"生长/收缩"途中被描出的 ——
-%   实际轨迹是螺旋，**两片叶根本不闭合**，谈不上"围绕叶心环绕"。
-%   实测（_diag_fig8_lobes.py，射线-线段求交判定"被包围"）：
-%       T2=18, B=6.0  满幅窗口 τ∈[12.7,27.3]  上叶 **无包围点**   -> 无法环绕
-%       T2=18, B=5.0  满幅窗口 τ∈[10.6,29.4]  最小距 0.0419 m    -> 净间隙 -171 mm FAIL
-%       T2=30, B=5.0  满幅窗口 τ∈[ 6.4,33.6]  最小距 0.2962 m    -> 净间隙  +83 mm PASS
-%       T2=45, B=5.0  满幅窗口 τ∈[ 4.2,35.8]  最小距 0.3913 m    -> 净间隙 +178 mm PASS ← 采用
-%   即"满幅窗口必须覆盖住 τ∈[5,35]"，要求 (T2 - 2B) 足够大。
-%
-%   ★ 加长 T2 同时**降低**参考加速度（∝ 1/T2²，链式法则 s = 40/T2）：
-%     T2 从 18 → 45 使 s 从 2.222 → 0.889，参考加速度降到原来的 16%。
-%     所以这个改动让系统**更稳**，而不是更难调 —— 两个目标方向一致。
-%
-%   ★ blendTime 取 5.0（下限）而不是 6.0：满幅窗口 = T2 - 2B，B 越小窗口越大。
-%     B 不能再小：B<5 会让包络二阶导尖峰 env''~1/B² 重新变大（见下），
-%     历史上 B=1.2 在 3.76 s 就发散。
-% ★★ amplitudeY 为什么是 1.62 而不是 1.20（对照论文 Fig. 2 实测）★★
-%   论文顶视图里八字的**宽高比约 1.85**（对原图做像素测量：期望轨迹包围盒
-%   宽 322 px / 高 174 px = 1.85）。原值 aX=1.50 / aY=1.20 给出 2*1.50/1.20
-%   = 2.50，明显比论文更"扁"。
-%   取 aY = 2*1.50/1.85 = **1.62 m** 即可复现论文的宽高比。
-%   实测代价（_diag_fe_ay.py 扫描，aX=1.50）：
-%       aY=1.20 (2.50)  环绕均值 117.3 mm / 峰值 587.9 mm / 终点 78.7 mm
-%       aY=1.35 (2.22)  环绕均值 123.1 mm / 峰值 621.6 mm / 终点 79.7 mm
-%       aY=1.50 (2.00)  环绕均值 128.9 mm / 峰值 657.2 mm / 终点 81.1 mm
-%       aY=1.62 (1.85)  环绕均值 133.7 mm / 峰值 686.6 mm / 终点 82.0 mm  ← 采用
-%       aY=1.70 (1.76)  环绕均值 136.9 mm / 峰值 706.5 mm / 终点 82.5 mm
-%       aY=1.85 (1.62)  环绕均值 142.9 mm / 峰值 744.0 mm / 终点 82.9 mm
-%   ★ 关键：全程**单调平滑劣化，没有任何发散悬崖** —— 从 1.20 到 1.85 都稳定。
-%     说明这套增益在纵向尺度上有充裕裕度，加高八字是安全的改动。
-% ★★ blendTime 为什么必须是 6.0 而不是 1.2（本项目最关键的调参结论）★★
-%   环绕段的参考轨迹是
-%       p_d(t) = startPos + env(tau) * [p̂(τ) - p̂(0)]
-%   其中 env 是"两端对称包络" env = σ(τ/B) * σ((T2-τ)/B)，
-%   目的是让环绕段的**入口与出口速度为零**，从而与起飞/降落段（静止端点）
-%   实现 C^2 拼接。σ 是五次 smoothstep，σ(0)=σ(1)=0、σ'(0)=σ'(1)=0、
-%   σ''(0)=σ''(1)=0，所以 env 及其一二阶导在两端都为零，光滑性没问题。
-%
-%   但把 env 展开成加速度时会出现三项：
-%       a(t) = env'' * p̂ + 2 * env' * s * v̂ + env * s² * â
-%   env'' ~ 1/B²。当 B 很小时（1.2 s），env'' 在 τ ≈ B 处（即包络出口）
-%   达到极大，而那里恰是 s²*â 也接近峰值的位置，两项**同相叠加**。
-%   实测（A=1.5 m, cycles=2）：
-%       参考加速度理论峰值（纯八字）      = 2.92 m/s²
-%       B = 1.2 s 时的实际参考加速度峰值 = 9.20 m/s²   ← 放大 3.15 倍
-%   这个 9.2 m/s² 的尖峰出现在 t = 3.7~4.2 s（包络窗口尾端），
-%   位置环 KX = 3.0 要求 9.2/3.0 ≈ 3 m 的稳态偏移才能平衡它，
-%   而绳长只有 0.35 m —— 系统必然发散。
-%
-%   放大倍数 ∝ 1/B²，所以把 B 从 1.2 s 拉到 6.0 s（放大 25 倍抑制）
-%   即可把尖峰压回理论量级。实测扫描：
-%       B = 1.2 s  -> t = 3.76 s 发散
-%       B = 6.0 s  -> 完整跑完 25 s 不发散
-%   B ∈ [5, 7] 均收敛，取 6.0，给包络留出 1/3 的环绕段时长。
-%
-%   ★ 用七次（C^3）smoothstep 代替五次只能把误差从 138 mm 降到 88 mm
-%     （_diag_fe_jerk.py），因为问题出在 **env'' 的幅值**而不是它的连续性，
-%     所以正解是加长 B，不是提高阶次。
-%
-%   ★ 与 USE_QID_DOT = false 配合（见 crazyflie_slung_controller.m）：
-%     这两个改动缺一不可。B=6 但保留 qid_dot 时在 13.12 s 仍发散；
-%     去掉 qid_dot 前馈后稳定域从 aX ≈ 0.15 m 一举扩到 0.80 m 以上。
-% ★★★ lockYaw = false：期望偏航 = **路径切线方向**（论文原式）。
-%   论文的 R0d 可让负载第一轴指向速度方向，即偏航随路径转。
-%   默认置 true 只用于静态参考 yaw = 0 的基准测试；它不等于关闭 yaw 反馈。
-%   将其置 false 会同时测试时变 yaw 参考，需检查张力裕度和偏航力矩交付率。
-%    早期实测置 false 确实发散 —— 但当时有**两个叠加原因**：
-%       ① 负载"偏航 <-> 绳索扭转"模态完全没有阻尼（见 payload.rotationalDamping
-%          的说明：新挂点必然带来 0.0333 m 质心偏移，产生 ω≈2.2 rad/s 的该模态）；
-%       ② 期望角速度 Omega0d 是用**对 R0d 做二阶中心差分**得到的，噪声很大
-%          （R0d 由速度方向构造，速度里又含包络导数项）。
-%     现在两者都已解决；默认工况仍固定参考 yaw，先隔离验证 yaw 闭环本身：
-%       ① 已补入物理转动阻尼 cfg.payload.rotationalDamping = 1e-3；
-%       ② 改用**解析切向**：b3d ≡ e3 ⇒ R0d = Rz(psi) 是纯偏航，
-%          Omega0d = [0;0;psiDot] 由解析式给出，psiDotDot 只对解析的 psiDot
-%          做一次中心差分（详见 crazyflie_slung_reference.m）。
-%     并且切向取**理想八字（不含包络）**的解析切向：两个分量不会同时为零，
-%     且 tau=0 与 tau=tEnd 处恰为 +x（psi=0），与起飞/降落段的 psi=0 天然连续，
-%     避免了"水平速度过零 ⇒ 方向无定义"的奇点。
-
-cfg.referenceFcn = [];    % 定高工况：清空轨迹函数 ⇒ 退回 cfg.target 静态悬停
-cfg.reference.omegaD = zeros(3, 1);    % 兜底值（实际由轨迹函数按解析切向给出）
+% ------------------------------------------------------------ 期望参考
+% ★ 本工程只有**定高**工况：期望参考就是上面的静态目标点 cfg.target，
+%   没有外部轨迹函数（八字轨迹只存在于另一个分支，已连同 cfg.referenceFcn
+%   和 cfg.figureEight 一起删除）。
+%   两条**时变**参考由仿真主程序自己生成，不在这里配置：
+%     ① 交接抬升段：冻结起点 + 5 次多项式剖面（cfg.takeoff.referenceLiftTime）
+%     ② 末段下降  ：5 次多项式剖面（cfg.takeoff.landingApproachFraction）
+%   两者的 jerk 都是解析算出来的 ⇒ analytic 前馈需要的量依然齐备。
+cfg.reference.omegaD = zeros(3, 1);    % 静态目标 ⇒ 负载期望角速度恒为 0
 cfg.reference.omegaDotD = zeros(3, 1);
-
-% ------------------------------------------------------- 锥形障碍物（仅显示 + 自检）
-% 对应论文 Fig. 2/Fig. 3 "two obstacles represented by cones"。
-% ★★ 两个锥摆在八字**两个叶的叶心**，负载**环绕**它们飞行 ★★
-%    （用户要求："八字形的两个圆心应位于圆锥的中心，并围绕该中心进行环绕"。）
-% ★ 障碍物只参与可视化与碰撞自检，不进入动力学（论文也未对其建模）。
-cfg.obstacles = struct();
-cfg.obstacles.enabled = false;   % 定高不做水平运动，无『绕障』可言 ⇒ 关掉锥体
-% ★★ 锥必须**竖直站立**（底面在地面、尖端朝上），且负载要飞在锥**中部偏上**，
-%    否则负载是从锥尖上方飞过去的，避障约束根本不起作用（见下面的踩坑记录）。
-%
-% ★ 八字的形状（必须记住，否则会算错叶心）★
-%   环绕段参考轨迹为 p_d = [aX·sin(ωX τ)·env, (aY/2)(1-cos(ωY τ))·env]，
-%   其中 ωX = 2·ωY（x 是**倍频**轴）⇒ **两片叶沿 y 上下堆叠**：
-%     自交点在 (0, aY/2) = (0, 0.81)
-%     上叶 y ∈ [0.81, 1.62]，下叶 y ∈ [0, 0.81]，两叶均横跨 x ∈ [-1.5, 1.5]
-%     （叶宽 = 2·aX = 3.0 m，叶高 = aY/2 = 0.81 m）
-%
-% ★ 叶心怎么定的：在**实际轨迹**（含两端包络）上求"被轨迹包围 且 到轨迹
-%   最小距离最大"的点（最大内切圆心）。判定"被包围"用的是**射线-线段求交**
-%   （不是射线-点：采样点间距约 50 mm，用"垂距 < 4 mm"当命中会恒判未包围，
-%    这个测试本身的 bug 一度让我误以为轨迹无解）。
-%   实测（T2=45, B=5，_diag_fig8_lobes.py / _diag_orbit_period.py）：
-%     上叶心 (-0.0187, +1.2252) -> 到轨迹最近 0.3947 m -> 净间隙 **+181.5 mm**
-%     下叶心 (-0.0187, +0.3948) -> 到轨迹最近 0.3938 m -> 净间隙 **+180.6 mm**
-%     （两叶心 x 略偏离 0 是包络的前后半段不完全对称造成的，很小）
-cfg.obstacles.positions = [-0.0187, -0.0187; 1.2252, 0.3948];  % 2x2，每列 = [x; y]
-cfg.obstacles.baseZ = 0.00;        % 锥底高度（z 向下为正，0 即地面）
-cfg.obstacles.height = 1.05;       % 锥高 [m]，负载飞在锥高 52% 处（见下）
-cfg.obstacles.radius = 0.15;       % 锥底半径 [m]
-cfg.obstacles.clearance = 0.05;    % 负载外接球到锥表面的最小允许间隙 [m]
-%
-% ★★ 锥高 1.05 m 的依据（对照论文 Fig. 2 侧视图实测）★★
-%   对论文侧视图做像素测量：锥尖 y=31 px、锥底 y=122 px => 锥高 91 px；
-%   负载块最密集处在 y≈78 px，即负载飞在**锥高的 52%** 处。
-%   本仿真环绕平面离地 0.55 m，故 H = 0.55 / 0.52 = **1.05 m**，
-%   这样负载恰好飞在锥高中的 52% 位置，与论文比例一致。
-%   （旧值 H=0.70 时负载在 79% 处，太靠近锥尖、视觉上像"擦着锥尖过"。）
-%   同时锥尖离地 1.05 m **高于**环绕平面 0.55 m（余量 0.50 m），
-%   所以负载必须水平绕行，避障是真实约束。
-%
-% ★★★ 曾经的设计错误（已修复，务必不要再犯）★★★
-%    旧值 positions=[0.75,-0.75;0.60,0.60]、baseZ=-0.35、height=0.30。
-%    问题 1（几何）：锥底在 z=-0.35（离地 0.35 m）而"高 0.30"在旧的可视化里是
-%      往**下**画的，于是锥是**倒插**的、锥尖扎在地面以下，且整个锥体都位于
-%      负载环绕平面（离地 0.55 m）的**下方** —— 负载是从锥上方飞过去的，
-%      避障约束根本不存在。
-%    问题 2（自检静默失效）：净间隙公式写成 hAboveBase = (baseZ - z) + height
-%      再与 height 比较，语义是"离锥顶的距离"而不是"离锥底的高度"。当锥长期
-%      位于负载平面以下时它恒 > height，于是整条轨迹都走 `gap = inf` 分支，
-%      **自检永远 PASS**。当时的 560.9 mm 其实是起飞瞬间（t = 0.41 s，负载还在
-%      地面附近）算出来的，与环绕段毫无关系 —— 一个典型的"假信心数字"。
-%    问题 3（穿模）：旧轴到参考路径只有 0.1516 m，小于锥底半径 + 负载外接球
-%      （0.22 + 0.1418 = 0.362 m），几何上就已经相交。
-%
-%    修法（三处一起改）：
-%      a. 锥移到叶心（见上）；
-%      b. 锥底落到地面（baseZ = 0），加高到 1.05 m，使负载飞在锥高的 52%
-%         （与论文一致）且锥尖**高于**环绕平面，避障成为真实约束；
-%      c. 间隙公式改用单一"离地高度"量，并加 nObsInside 门控：
-%         若落在锥高度区间内的采样点为 0，直接判 obstacleClearanceValid = false。
-%
-% 核算：负载高度 0.55 m 处锥半径 r = 0.15 * (1 - 0.55/1.05) = 0.0714 m
-%       负载外接球半径 = 0.5 * norm([0.20,0.20,0.020]) = 0.1418 m
-%       上叶净间隙 = 0.3947 - 0.0714 - 0.1418 = **+181.5 mm**（= 判据的 3.6 倍）
-%       且是环绕段内的真实值（不是起飞瞬间的假值）
-%       回归测试见 _verify_python/_test_obstacle_clearance.py
 
 % ------------------------------------------------------------ 可视化参数
 %
@@ -645,8 +522,7 @@ cfg.visualization = struct(...
     ...                               %   会远大于 0.55 m，此时该下限自动失效（这没问题：
     ...                               %   跨度大是必然的，负载可读性由负载显示缩放保证）。
     'trajectoryWindow', 25.0, ...     % 三维轨迹子图只显示前 N 秒 [s]
-    'trajectoryMinSpan', 0.50, ...    % 三维轨迹子图的最小轴框跨度 [m]
-    'showReferencePath', true);       % 三维图里画期望八字轨迹（虚线）
+    'trajectoryMinSpan', 0.50);       % 三维轨迹子图的最小轴框跨度 [m]
 
 % ------------------------------------------------------- 参数合法性检查
 if cfg.vehicle.count < 3
@@ -660,6 +536,21 @@ end
 
 % 用户参数覆盖默认值（递归合并）
 cfg = mergeStruct(cfg, userCfg);
+
+validOmegaCMethods = {'analytic', 'command_filter', 'high_gain_observer', ...
+    'filtered_log_difference', 'none'};
+if ~(ischar(cfg.attitudeController.omegaCMethod) ...
+        || (isstring(cfg.attitudeController.omegaCMethod) ...
+        && isscalar(cfg.attitudeController.omegaCMethod)))
+    error('crazyflie_slung_parameters:BadOmegaCMethod', ...
+        'attitudeController.omegaCMethod 必须是字符串。');
+end
+cfg.attitudeController.omegaCMethod = char(cfg.attitudeController.omegaCMethod);
+if ~any(strcmpi(cfg.attitudeController.omegaCMethod, validOmegaCMethods))
+    error('crazyflie_slung_parameters:BadOmegaCMethod', ...
+        '未知 omegaCMethod "%s"；可选值：%s。', ...
+        cfg.attitudeController.omegaCMethod, strjoin(validOmegaCMethods, ', '));
+end
 
 % ------------------------------------------------------------------ 尺寸驱动的派生参数
 % payload.size 是几何参数源。除非用户明确给出更高优先级的自定义值，
@@ -922,9 +813,6 @@ if cfg.takeoff.enabled && ~userHasInitialPosition
     halfHeight = 0.5 * sum(abs(cfg.initial.R0(3, :)) ...
         .* cfg.payload.size(:).');
     cfg.initial.position(3) = cfg.takeoff.groundZ - halfHeight;
-    if isfield(cfg, 'figureEight')
-        cfg.figureEight.startPosition = cfg.initial.position;
-    end
 end
 if ~userHasInitialLinks
     if cfg.link.allowTiltedCables
